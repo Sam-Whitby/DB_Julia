@@ -104,11 +104,11 @@ by any binomial denominator including **`1+exp`** (Barker/Glauber) as well as
 
 Translational invariance is **always reported**; it does not by itself fail the
 run (an absolute-field algorithm like `quadratic_field` is correctly τ-FAIL yet
-DB-PASS). Lattice symmetry (translations and any verified subgroup of the square point group
-p4m) is exploited to speed the detailed-balance check, but only after being
-**verified on the computed transition graph** — the algorithm itself is never
-trusted (see "How it works" §6). Any subgroup — full D4, D2, a single reflection —
-is discovered automatically.
+DB-PASS). Both lattice symmetry (translations + the square point group p4m) **and
+species-permutation symmetry** (relabeling the particle types, which permutes the
+symbolic couplings) are exploited to speed the detailed-balance check — but only
+after being **verified on the computed transition graph**, so the algorithm itself
+is never trusted (see "How it works" §6). Any subgroup is discovered automatically.
 
 ---
 
@@ -173,29 +173,34 @@ is zero** — checked exactly with `Rational{Int128}`. Grouping by exponent vect
 handles half-integer exponents (e.g. `exp(-β·dE/2)`) directly.
 
 ### 6. Symmetry-reduced DB check — verified on the graph, never assumed
-The square lattice's full symmetry group is `p4m` = translations ⋊ D4 (four
-rotations + four reflections). If a lattice symmetry `g` is a symmetry of the
-*system*, then `T(g·s → g·t) = T(s→t)` and `π(g·s) = π(s)`, so the
-detailed-balance residual of `(g·s, g·t)` is **identical** to that of `(s,t)` —
-and DB need be checked on only one pair per symmetry orbit (up to ~`8·n²` fewer
-pairs).
+Two kinds of symmetry are exploited, both **verified on the already-computed
+transition graph** (never assumed of the algorithm), so they are speed-only and
+can never change the verdict:
 
-The checker does **not** assume the algorithm has any particular symmetry; it
-**verifies each candidate element of p4m on the already-computed transition graph**,
-which is sound and cheap:
+**Spatial (`p4m` = translations ⋊ D4).** If a lattice symmetry `g` is a symmetry of
+the *system* then `T(g·s→g·t) = T(s→t)` and `π(g·s) = π(s)`, so the DB residual of
+`(g·s, g·t)` is **identical** to that of `(s,t)`. Verified by: **energy invariance**
+`E(g·s) = E(s)` (exact integer-vector comparison) and **graph equivariance** — every
+edge `(s→t)` has an edge `(g·s→g·t)` with the *identical multiset of weight indices*
+(weights are hash-consed over distance-based atoms, so equal indices ⇒ identical
+symbolic weights). All 8 D4 elements are tried individually, so any subgroup (D4,
+D2, C4, …) is found.
 
-- **energy invariance** `E(g·s) = E(s)` (exact integer-vector comparison), and
-- **graph equivariance** — every edge `(s→t)` has an edge `(g·s→g·t)` carrying the
-  *identical multiset of weight indices*. Because weights are hash-consed over
-  distance-based (hence rotationally invariant) coupling atoms, equal indices imply
-  *identical* symbolic weights — a sufficient, exact test.
+**Species (type permutation).** A permutation `σ` of the species labels relabels the
+symbolic coupling atoms — a *bijection of coupling space* — so it too is a symmetry
+of the DB problem when the algorithm is species-equivariant: then
+`R_{σs,σt}(J) = R_{s,t}(σ⁻¹·J)`, and a residual that is identically zero stays so
+under a coordinate bijection. The same graph verification is used, now **up to the
+atom relabeling**: energy must equal the σ-permuted energy, and each edge's weights
+must equal the σ-*relabeled* originals (each weight's atoms are permuted, re-interned,
+and looked up — index 0 if absent ⇒ candidate rejected). Generators are the
+multiplicity-preserving label transpositions, so `[1,2,3]→S₃`, `[1,2]→S₂`, and
+unequal multiplicities give nothing. `vmmc_2d` is correctly declined (its cluster
+sort tie-breaks on the type label).
 
-All 8 non-identity elements of D4 are checked individually as candidates (not just
-the two generators): any subgroup — full D4, D2 (180° + reflections), C4, C2, a
-single reflection — is discovered automatically from the graph. A symmetry that
-does not verify is dropped (more pairs are checked, never fewer), so this is
-**speed-only and can never change the verdict** — proven in the test suite, which
-checks every example's reduced verdict against the full all-pairs baseline.
+A candidate that does not verify is dropped (more pairs checked, never fewer). The
+full reduction uses one pair per orbit of `(verified spatial) × (verified species)`.
+The test suite checks every example's reduced verdict against the all-pairs baseline.
 
 > **Point-group symmetry and detailed balance are independent.** An algorithm with
 > only D2 symmetry (e.g. `horizontal_metropolis`, column-moves only) can still
@@ -215,12 +220,13 @@ checks every example's reduced verdict against the full all-pairs baseline.
 - **Translation-orbit reduction (BFS):** one representative per translation orbit
   is BFS'd and its leaves are translated to the rest — sound because the covariance
   check guarantees equivariance (falls back to all-states otherwise).
-- **Graph-verified `p4m` symmetry reduction (DB check):** detailed balance is
-  evaluated on one pair per orbit of the **verified subgroup** of p4m (§6). Any
-  subgroup — full D4, D2, a single reflection — is discovered automatically from
-  the computed graph. For VMMC this cuts pairs from 11088 to 174 and DB-check time
-  from ≈2.1 s to ≈0.9 s. For `horizontal_metropolis` the D2 subgroup gives a 21×
-  reduction (126→6 pairs).
+- **Graph-verified symmetry reduction (DB check):** detailed balance is evaluated
+  on one pair per orbit of the verified `(spatial p4m) × (species permutation)`
+  group (§6) — any subgroup is discovered automatically from the computed graph.
+  For VMMC this cuts pairs from 11088 to 174 (DB-check ≈2.1 s → ≈0.9 s); adding
+  species symmetry cuts single-Metropolis 72→16 and kawasaki 18→6. (The pair-count
+  drop is large, but wall-time gain is bounded — the DB cost is dominated by the
+  distinct-weight evaluations, not the pair count.)
 - **`-parallel`** (with `julia -t auto`) spreads the per-representative BFS and the
   per-pair DB check across cores; the exact LP and the verdict are unchanged.
 
@@ -229,39 +235,46 @@ checks every example's reduced verdict against the full all-pairs baseline.
 ## Examples & timings
 
 All examples live in `examples/`. Verdicts and chamber counts below are the exact
-results. The **DB pairs** column shows how many pairs the graph-verified `p4m`
-symmetry reduction actually checks versus the total (`sym` = which symmetries
-verified: T = translations, D4 = full point group, T_c = column translations only).
+results. The **DB pairs** column shows how many pairs the graph-verified symmetry
+reduction actually checks versus the total. The `sym` column lists the verified
+**spatial** group (T = translations, D4 = full point group, T_c = column-only,
+D2 = `{rot180, reflect_h, reflect_v}`) and the verified **species** group acting on
+the type labels (`S₃`, `S₂`, …).
 
-| Example | Trans. | Detailed balance | Ergodicity | states | chambers | DB pairs | sym |
+| Example | Trans. | Detailed balance | Ergodicity | states | chambers | DB pairs | sym (spatial × species) |
 |---|---|---|---|---|---|---|---|
-| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 | 72 / 4536 | T + full D4 |
-| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 | 18 / 756 | T + full D4 |
-| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 | 8 / 16 | T_col + reflect_v |
-| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 | 6 / 252 | T + full D4 |
-| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 | 20 / 1792 | T + full D4 |
-| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 | 261 / 4536 | T + reflect_h |
-| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 | 72 / 4536 | T + full D4 |
-| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 | 8 / 16 | T_col + reflect_v |
-| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 | 174 / 11088 | T + full D4 |
-| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 | 20 / 1792 | T + full D4 |
-| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 20 / 1792 | T + full D4 |
-| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 8 / 42 | T_col + reflect_v |
-| `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 6 | 6 / 126 | T + **D2** |
-| `barker_accept.jl` | PASS | PASS | PASS | 504 | 1 | 72 / 4536 | T + full D4 |
-| `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 48 | 72 / 4536 | T + full D4 |
+| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 | 16 / 4536 | p4m × S₃ |
+| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 | 6 / 756 | p4m × S₃ |
+| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 | 4 / 16 | T_c, reflect_v × S₂ |
+| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 | 3 / 252 | p4m × S₂ |
+| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 | 10 / 1792 | p4m × S₂ |
+| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 | 46 / 4536 | T, reflect_h × S₃ |
+| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 | 16 / 4536 | p4m × S₃ |
+| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 | 4 / 16 | T_c, reflect_v × S₂ |
+| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 | 174 / 11088 | p4m (species n/a) |
+| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 | 10 / 1792 | p4m × S₂ |
+| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 10 / 1792 | p4m × S₂ |
+| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 4 / 42 | T_c, reflect_v × S₂ |
+| `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 6 | 3 / 126 | **D2** × S₂ |
+| `barker_accept.jl` | PASS | PASS | PASS | 504 | 1 | 16 / 4536 | p4m × S₃ |
+| `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 48 | 16 / 4536 | p4m × S₃ |
 
-T = both translation generators; T_col = column translation only; D4 = full 8-element
-point group; D2 = {rotate180, reflect_h, reflect_v} (horizontal-only subgroup).
+The `sym` column shows exactly what the *graph* has, not what was assumed.
+`broken_biased_direction` gets `reflect_h` but not `reflect_v`/`rotate90` (the
+column bias survives a row-flip, not a column-flip). The row-field examples
+(`quadratic_field`, `broken_field_wrong_accept`, `reflect_move`) get column
+translation + `reflect_v` only. `horizontal_metropolis` has **D2 not D4**.
 
-The symmetry column shows exactly what the *graph* has, not what was assumed.
-`broken_biased_direction` gets `reflect_h` (column bias is symmetric under row-flip)
-but not `reflect_v` or `rotate90` (column-flip would swap the biased and unbiased
-directions). The row-field examples (`quadratic_field`, `broken_field_wrong_accept`,
-`reflect_move`) get column translation and `reflect_v` but not row-involving
-symmetries. `horizontal_metropolis` has **D2 not D4** — 90° rotation maps column
-moves to row moves, which are outside the proposal set, so `rotate90` correctly
-fails to verify while all D2 elements pass.
+**Species (type) symmetry.** A permutation of the species labels relabels the
+symbolic coupling atoms, so it is a symmetry of the DB problem when the algorithm
+is species-equivariant — verified on the computed graph *up to that atom relabeling*
+(§6). All-distinct triples (`[1,2,3]`) give `S₃` (a further 3–6× on top of p4m);
+`[1,2]` gives `S₂`. `vmmc_2d` gets **no** species symmetry: its cluster builder
+tie-breaks candidate order on the type label, so it is not *leaf-level*
+species-equivariant and the checker conservatively declines (sound — it never
+assumes). The reductions cut the *pair count* substantially (e.g. single-Metropolis
+72→16) though wall-time gain is bounded because the DB cost is dominated by the
+distinct-weight evaluations, not the pair count.
 
 Four are deliberate edge cases: a correct power-of-two pool on 4×4
 (`hop_8way_correct`); a larger interacting 4×4 system (`metropolis_4x4`); a
@@ -276,15 +289,19 @@ acceptance uses a `1+exp` denominator (no conditions, so a single chamber), and 
 rate-limited Metropolis carries a polynomial coupling factor (`a`, the 7th atom)
 times the Boltzmann exponentials.
 
-**Warm compute (JIT excluded), serial** on an Apple-silicon laptop:
+**Warm compute (JIT excluded), serial** on an Apple-silicon laptop. The `model`
+phase now also runs the species-symmetry verification (permuting + re-interning
+weights); for a species-equivariant case like single-Metropolis that is ~0.1 s,
+and for VMMC it bails immediately (declined).
 
 | Example | BFS | model | DB check | total |
 |---|---|---|---|---|
-| `single_metropolis.jl` | 0.2 s | 0.01 s | 1.2 s | ≈ 1.5 s |
-| `metropolis_4x4.jl` | 0.04 s | 0.01 s | 0.27 s | ≈ 0.3 s |
+| `single_metropolis.jl` | 0.2 s | 0.10 s | 1.1 s | ≈ 1.4 s |
+| `metropolis_4x4.jl` | 0.03 s | 0.01 s | 0.23 s | ≈ 0.3 s |
 | `barker_accept.jl` | 0.2 s | 0.02 s | ~0 s | ≈ 0.2 s |
-| `poly_rate_accept.jl` | 0.4 s | 0.02 s | 1.2 s | ≈ 1.6 s |
-| `vmmc_2d.jl` | 3.3 s | 0.06 s | 1.1 s | ≈ 4.4 s |
+| `poly_rate_accept.jl` | 0.4 s | 0.02 s | 1.4 s | ≈ 1.8 s |
+| `kawasaki.jl` | 0.02 s | 0.01 s | ~0 s | ≈ 0.03 s |
+| `vmmc_2d.jl` | 3.0 s | 0.05 s | 1.0 s | ≈ 4.1 s |
 
 The polynomial-coefficient ring and `1+exp` denominators add no measurable cost to
 the existing cases (constant coefficients take a fast path). The graph-verified

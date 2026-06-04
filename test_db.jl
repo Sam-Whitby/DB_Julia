@@ -339,4 +339,45 @@ end
     end
 end
 
+# Species-permutation symmetry (Step-4 graph-verified, atom-relabeling action).
+@testset "species (type) permutation symmetry" begin
+    n = 3; energy = mk_energy(n, 2)
+    model(types, step) = build_dbmodel(build_transitions(step, energy, enumerate_states(types, n), n, 30), energy)
+    has_type(m) = any(s -> startswith(s, "type"), m.sym_names)
+    eqfull(m) = run_db_check(m)[1] == run_db_check(m; use_symmetry=false)[1]
+
+    # [1,2,3]: type-equivariant single-particle Metropolis -> full S3 (both transpositions),
+    # giving a strict pair reduction beyond p4m, and the verdict is unchanged.
+    m123 = model([1,2,3], mk_metropolis(n, 2, energy))
+    @test ("type(1<->2)" in m123.sym_names) && ("type(2<->3)" in m123.sym_names)
+    @test length(m123.check_pairs) < length(m123.pairs)
+    @test eqfull(m123)
+
+    # [1,1,2]: the multiplicities differ, so NO species permutation preserves the
+    # state multiset -> no species symmetry is even a candidate.
+    m112 = model([1,1,2], mk_metropolis(n, 2, energy))
+    @test !has_type(m112)
+    @test eqfull(m112)
+
+    # type-DEPENDENT algorithm (only species 1 ever moves). This privileges species
+    # 1 but treats species 2 and 3 identically, so its actual species symmetry is
+    # exactly the subgroup that FIXES species 1, i.e. swapping the spectators 2<->3.
+    # The checker discovers precisely that: type(2<->3) verifies, type(1<->2) does
+    # not -- and the DB verdict is unchanged (reduced == full) either way.
+    only1 = (rng, st::PState) -> begin
+        idxs = Int[i for i in 1:length(st) if st[i].t == 1]      # absolute-type branch
+        isempty(idxs) && return st
+        i = rand_choice!(rng, idxs); p = st[i]
+        (dr, dc) = rand_choice!(rng, DISPS8); np = Particle(p.r + dr, p.c + dc, p.t)
+        rest = st[setdiff(1:length(st), i)]
+        for q in rest; same_site(q, np, n) && return st; end
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        metropolis!(rng, dE) ? ns : st
+    end
+    m_only1 = model([1,2,3], only1)
+    @test ("type(2<->3)" in m_only1.sym_names)                   # spectator swap IS a symmetry
+    @test !("type(1<->2)" in m_only1.sym_names)                  # privileged species is not swappable
+    @test eqfull(m_only1)                                        # verdict still correct
+end
+
 end

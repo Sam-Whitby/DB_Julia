@@ -357,3 +357,33 @@ in expressiveness.md §6): algebraic constants and many-body atom constructors
 (low value / need the number-field core), and full nested-min (only condition-free
 min/max operands are handled). Non-linear exponents/conditions and trig fields
 remain Tier 3 / out of scope.
+
+### 5.12 Species-permutation symmetry in the DB check (Step 4)
+
+The graph-verified symmetry reduction (§5.9–5.10) was extended from the spatial
+point group p4m to also include **species (type) permutations**. Relabeling the
+particle species permutes the symbolic coupling atoms — a bijection of coupling
+space — so it is a symmetry of the detailed-balance problem whenever the algorithm
+is species-equivariant: `R_{σs,σt}(J) = R_{s,t}(σ⁻¹·J)`, and a residual identically
+zero stays so under a coordinate bijection. This is the same logic as the spatial
+reduction, but the action permutes the atoms instead of fixing them.
+
+Verification is again purely on the COMPUTED graph (no algorithm trust): the energy
+must equal the σ-permuted energy (exact integer-vector check), and each edge's
+weights must equal the σ-RELABELED originals — computed by permuting each weight's
+atoms (`permute_atoms_th`), re-interning, and looking the result up by weight key
+(absent ⇒ index 0 ⇒ candidate rejected). The lookup is lazy and bails on the first
+missing image, so a non-equivariant candidate (e.g. VMMC, whose cluster sort
+tie-breaks on the type label and so is not leaf-level species-equivariant) costs
+~nothing and is correctly declined. Generators are the multiplicity-preserving
+label transpositions (`[1,2,3]→S₃`, `[1,2]→S₂`, unequal multiplicities → none); the
+union-find composes them with the spatial generators.
+
+Effect: pair counts drop further (single-Metropolis 72→16, kawasaki 18→6,
+metropolis_4x4 20→10); VMMC unchanged (declined). As with D4, the wall-time gain is
+bounded because the DB cost is dominated by distinct-weight evaluation, not pair
+count. Soundness is unchanged and reconfirmed: the suite asserts reduced == all-pairs
+verdict on every example, plus a focused test that `[1,2,3]` yields S₃, `[1,1,2]`
+yields nothing, and a species-dependent algorithm ("only species 1 moves") yields
+exactly the spectator subgroup `type(2<->3)` but not `type(1<->2)` — the checker
+discovers the true partial symmetry and never over-reduces. 185 tests pass.
