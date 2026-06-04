@@ -186,6 +186,7 @@ EXPECT = [
     ("hop_8way_correct",            (true,  true,  true )),   # power-of-two pool, 4x4
     ("metropolis_4x4",              (true,  true,  true )),   # larger lattice
     ("reflect_move",                (false, true,  false)),   # covariance guard -> fallback
+    ("horizontal_metropolis",       (true,  true,  false)),   # D2 not D4; erg FAIL by design
 ]
 
 function _run_pipeline(n, types, algo, energy)
@@ -224,24 +225,44 @@ end
     @test r.nreps <= r.npairs
 end
 
-# D4 vs detailed balance are logically INDEPENDENT (the reduction is speed-only):
-#  - an anisotropic defect breaks BOTH point-group symmetry AND DB;
+# Point-group symmetry and detailed balance are logically INDEPENDENT:
+#  - an anisotropic defect may break BOTH point-group symmetry AND DB;
 #  - an isotropic defect breaks DB but keeps full p4m symmetry;
-#  - a symmetric correct move has full symmetry and satisfies DB.
-@testset "D4 ⟂ DB independence (reduction is speed-only, never a verdict)" begin
+#  - a symmetric correct move has full symmetry and satisfies DB;
+#  - an anisotropic CORRECT move may have only a subgroup (D2, not D4) yet still DB-PASS.
+# In all cases the symmetry reduction is speed-only: it can only reduce pair-checks,
+# NEVER alter the DB verdict. "Symmetry verified" does not mean "DB holds"; "symmetry
+# not verified" does not mean "DB fails".
+@testset "Point-group ⟂ DB: reduction is speed-only, never a verdict" begin
+    # Anisotropic broken: breaks D4 AND DB (directional bias breaks both).
     bias = run_example(joinpath(@__DIR__, "examples", "broken_biased_direction.jl"))
     @test bias.db == false                                   # DB violated
-    @test !("rotate90" in bias.sym) && !("reflect" in bias.sym)  # anisotropy breaks D4 too
-    @test bias.db == bias.db_full                            # still caught with translations only
+    @test !("rotate90" in bias.sym)                          # anisotropy: D4 not verified
+    @test bias.db == bias.db_full                            # DB still caught despite partial sym
 
+    # Isotropic broken: full D4 symmetry verified, yet DB fails.
     pool = run_example(joinpath(@__DIR__, "examples", "broken_variable_pool.jl"))
     @test pool.db == false                                   # DB violated
-    @test ("rotate90" in pool.sym) && ("reflect" in pool.sym)    # isotropic: D4 holds anyway
+    @test ("rotate90" in pool.sym) && ("rotate180" in pool.sym)  # isotropic: full D4 verified
     @test pool.db == pool.db_full                            # D4-PASS does NOT hide the DB failure
 
+    # Symmetric correct: full D4 symmetry, DB holds.
     good = run_example(joinpath(@__DIR__, "examples", "single_metropolis.jl"))
     @test good.db && ("rotate90" in good.sym) && ("reflect" in good.sym)
-    @test good.nreps < good.npairs                           # full p4m actually reduces work
+    @test good.nreps < good.npairs                           # full p4m reduces work
+
+    # CRITICAL: D2 (not D4) correct algorithm -- key independence example.
+    # Horizontal-only Metropolis has D2 (rotate180, reflect_h, reflect_v) but NOT D4
+    # (rotate90 maps column-moves to row-moves, outside the proposal set). Yet DB holds.
+    # This proves D4-FAIL can never be used to conclude DB-FAIL.
+    hm = run_example(joinpath(@__DIR__, "examples", "horizontal_metropolis.jl"))
+    @test hm.db == true                                      # DB PASSES despite not being D4
+    @test !("rotate90" in hm.sym)                            # rotate90 correctly not verified
+    @test !("reflect" in hm.sym)                             # diagonal reflect also not verified
+    @test ("rotate180" in hm.sym) && ("reflect_h" in hm.sym) && ("reflect_v" in hm.sym)
+    @test hm.erg == false                                    # ergodic FAIL by design (rows fixed)
+    @test hm.nreps < hm.npairs                               # D2 still gives real pair reduction
+    @test hm.db == hm.db_full                                # reduced == full check
 end
 
 end

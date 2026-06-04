@@ -309,3 +309,19 @@ symmetry-reduced verdict and chamber count equal the all-pairs baseline, and enc
 the D4⟂DB independence facts (an anisotropic defect breaks both; an isotropic defect
 breaks DB while keeping full symmetry; a failed symmetry check is never read as a DB
 conclusion).
+
+### 5.10 Generalised from D4 to arbitrary p4m subgroups (follow-up)
+
+The initial implementation (§5.9) checked only two generators of D4 (rotate90 and
+diagonal reflect), which meant subgroups like D2 (e.g. 180° rotation + axis
+reflections) were not discovered unless those generators happened to verify. This
+was extended to check all 8 non-identity elements of D4 as individual candidates
+(rotate90, rotate180, rotate270, reflect, reflect_h, reflect_v, reflect_ad), so any
+subgroup of p4m is now automatically discovered. The cost is 6 extra graph scans per
+run, each O(#states + #edges) and dominated by the DB computation itself. The
+correctness argument is unchanged: candidates are only admitted if they pass the
+exact energy and graph checks. `examples/horizontal_metropolis.jl` is the canonical
+test case: column-only Metropolis has D2 symmetry (verified: rotate180, reflect_h,
+reflect_v) but not D4 (rotate90 maps column moves to row moves, outside the proposal
+set, so it correctly fails verification), yet DB PASS -- confirming that
+point-group symmetry and detailed balance are independent in both directions.

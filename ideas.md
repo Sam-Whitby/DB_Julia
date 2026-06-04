@@ -249,7 +249,12 @@ holds *after summing over the RNG* (a uniform choice over a `D4`-closed list is
 no linear tag that exposes it from one BFS, because the obstruction lives in the
 *permutation of the choice lists and the re-sorting*, not in the position algebra.
 
-### 2.2 The dilemma the project keeps hitting
+### 2.2 The dilemma the project keeps hitting (applies to D4-for-BFS specifically)
+
+Note: the dilemma below is about using *any* point-group symmetry to speed the
+**BFS phase**. The DB-check phase is now fully resolved (§2.3 implemented), and
+captures any subgroup of p4m including D2. The remaining unresolved question is
+BFS speed only.
 
 Two ways to get a sound `D4`-reduced **BFS**, both unsatisfactory:
 
@@ -274,10 +279,14 @@ the symbolic BFS of the reps and the per-pair DB residual, not the state count.
 
 ### 2.3 The one honest win: D4 on the DB-check phase, verified on the *graph*
 
-> **Status: implemented.** This is now the production DB-check path (`dbc.jl`,
-> `_verified_graph_symmetry_reps`; AUDIT §5.9). For VMMC it cuts the pairs checked
-> from 11088 to 174 and the DB-check time ≈2.1 s → ≈0.9 s, and the suite proves the
-> reduced verdict equals the all-pairs baseline on every example.
+> **Status: implemented and extended.** This is now the production DB-check path
+> (`dbc.jl`, `_verified_graph_symmetry_reps`; AUDIT §5.9–5.10). The initial
+> implementation checked only two generators (rotate90, reflect diagonal); it has
+> been extended to check all 8 elements of D4 individually, so any subgroup —
+> including D2 — is automatically discovered from the graph. For VMMC it cuts pairs
+> from 11088 to 174 and DB-check time ≈2.1 s → ≈0.9 s. For `horizontal_metropolis`
+> (D2 symmetry only), pairs drop 21× (126→6). The suite proves the reduced verdict
+> equals the all-pairs baseline on every example.
 
 There is a place where D4 *can* help **soundly and without trusting the
 algorithm**: the **detailed-balance check phase**, by exploiting symmetry of the

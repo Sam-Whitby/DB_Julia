@@ -97,10 +97,11 @@ the next state with plain arithmetic — the harness wraps it onto the torus for
 
 Translational invariance is **always reported**; it does not by itself fail the
 run (an absolute-field algorithm like `quadratic_field` is correctly τ-FAIL yet
-DB-PASS). Full lattice symmetry (translations **and** the square point group D4)
-is exploited to speed the detailed-balance check, but only after being **verified
-on the computed transition graph** — the algorithm itself is never trusted (see
-"How it works" §6).
+DB-PASS). Lattice symmetry (translations and any verified subgroup of the square point group
+p4m) is exploited to speed the detailed-balance check, but only after being
+**verified on the computed transition graph** — the algorithm itself is never
+trusted (see "How it works" §6). Any subgroup — full D4, D2, a single reflection —
+is discovered automatically.
 
 ---
 
@@ -165,36 +166,36 @@ is zero** — checked exactly with `Rational{Int128}`. Grouping by exponent vect
 handles half-integer exponents (e.g. `exp(-β·dE/2)`) directly.
 
 ### 6. Symmetry-reduced DB check — verified on the graph, never assumed
-The square lattice's full symmetry group is `p4m` = translations ⋊ D4 (rotations
-and reflections). If a lattice symmetry `g` is a symmetry of the *system*, then
-`T(g·s → g·t) = T(s→t)` and `π(g·s) = π(s)`, so the detailed-balance residual of
-`(g·s, g·t)` is **identical** to that of `(s,t)` — and DB need be checked on only
-one pair per symmetry orbit (up to ~`8·n²` fewer pairs).
+The square lattice's full symmetry group is `p4m` = translations ⋊ D4 (four
+rotations + four reflections). If a lattice symmetry `g` is a symmetry of the
+*system*, then `T(g·s → g·t) = T(s→t)` and `π(g·s) = π(s)`, so the
+detailed-balance residual of `(g·s, g·t)` is **identical** to that of `(s,t)` —
+and DB need be checked on only one pair per symmetry orbit (up to ~`8·n²` fewer
+pairs).
 
-Crucially, the checker does **not** assume the algorithm has this symmetry; it
-**verifies it on the already-computed transition graph**, which is sound and cheap:
+The checker does **not** assume the algorithm has any particular symmetry; it
+**verifies each candidate element of p4m on the already-computed transition graph**,
+which is sound and cheap:
 
 - **energy invariance** `E(g·s) = E(s)` (exact integer-vector comparison), and
 - **graph equivariance** — every edge `(s→t)` has an edge `(g·s→g·t)` carrying the
-  *identical multiset of weight indices*. Because weights are built from
-  D4-invariant coupling atoms and hash-consed, equal indices imply *identical*
-  symbolic weights (a sufficient, exact test).
+  *identical multiset of weight indices*. Because weights are hash-consed over
+  distance-based (hence rotationally invariant) coupling atoms, equal indices imply
+  *identical* symbolic weights — a sufficient, exact test.
 
-Both checks are `O(#states + #edges)` for the generators of `p4m`. A symmetry that
-does not verify is simply dropped (more pairs are checked, never fewer than
-correctness needs), so this is **speed-only and can never change the verdict** —
-proven in the test suite, which checks every example's reduced verdict against the
-full all-pairs baseline. The reduction picks up *partial* symmetry too: a
-row-dependent field (`quadratic_field`, `broken_field_wrong_accept`) verifies only
-column translations, and a directional bias (`broken_biased_direction`) verifies
-only translations (its anisotropy correctly fails D4) — yet the DB violation is
-still caught in both.
+All 8 non-identity elements of D4 are checked individually as candidates (not just
+the two generators): any subgroup — full D4, D2 (180° + reflections), C4, C2, a
+single reflection — is discovered automatically from the graph. A symmetry that
+does not verify is dropped (more pairs are checked, never fewer), so this is
+**speed-only and can never change the verdict** — proven in the test suite, which
+checks every example's reduced verdict against the full all-pairs baseline.
 
-> **D4 and detailed balance are independent.** A D4-asymmetric algorithm can still
-> satisfy DB (e.g. horizontal-only Metropolis), and a perfectly D4-symmetric one
-> can violate it (e.g. `broken_metropolis_halfbeta`, `broken_variable_pool`). So a
-> failed symmetry check is **never** used to conclude anything about DB — it only
-> means more pairs are evaluated. The DB verdict is always computed in full.
+> **Point-group symmetry and detailed balance are independent.** An algorithm with
+> only D2 symmetry (e.g. `horizontal_metropolis`, column-moves only) can still
+> satisfy DB. A perfectly D4-symmetric algorithm can violate DB (e.g.
+> `broken_metropolis_halfbeta`, `broken_variable_pool`). A failed symmetry check is
+> **never** used to conclude anything about DB — it only means more pairs are
+> evaluated. The DB verdict is always computed in full.
 
 ### Why it is fast
 - Exact arithmetic in **`Rational{Int128}`** rather than `BigInt`: the BFS no
@@ -208,9 +209,11 @@ still caught in both.
   is BFS'd and its leaves are translated to the rest — sound because the covariance
   check guarantees equivariance (falls back to all-states otherwise).
 - **Graph-verified `p4m` symmetry reduction (DB check):** detailed balance is
-  evaluated on one pair per symmetry orbit, using only symmetries verified on the
-  computed graph (§6). For VMMC this cuts the pairs checked from 11088 to 174 and
-  the DB-check time from ≈2.1 s to ≈0.9 s.
+  evaluated on one pair per orbit of the **verified subgroup** of p4m (§6). Any
+  subgroup — full D4, D2, a single reflection — is discovered automatically from
+  the computed graph. For VMMC this cuts pairs from 11088 to 174 and DB-check time
+  from ≈2.1 s to ≈0.9 s. For `horizontal_metropolis` the D2 subgroup gives a 21×
+  reduction (126→6 pairs).
 - **`-parallel`** (with `julia -t auto`) spreads the per-representative BFS and the
   per-pair DB check across cores; the exact LP and the verdict are unchanged.
 
@@ -225,27 +228,39 @@ verified: T = translations, D4 = full point group, T_c = column translations onl
 
 | Example | Trans. | Detailed balance | Ergodicity | states | chambers | DB pairs | sym |
 |---|---|---|---|---|---|---|---|
-| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 | 72 / 4536 | T·D4 |
-| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 | 18 / 756 | T·D4 |
-| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 | 8 / 16 | T_c |
-| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 | 6 / 252 | T·D4 |
-| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 | 20 / 1792 | T·D4 |
-| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 | 504 / 4536 | T |
-| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 | 72 / 4536 | T·D4 |
-| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 | 8 / 16 | T_c |
-| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 | 174 / 11088 | T·D4 |
-| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 | 20 / 1792 | T·D4 |
-| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 20 / 1792 | T·D4 |
-| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 14 / 42 | T_c |
+| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 | 72 / 4536 | T + full D4 |
+| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 | 18 / 756 | T + full D4 |
+| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 | 8 / 16 | T_col + reflect_v |
+| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 | 6 / 252 | T + full D4 |
+| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 | 20 / 1792 | T + full D4 |
+| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 | 261 / 4536 | T + reflect_h |
+| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 | 72 / 4536 | T + full D4 |
+| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 | 8 / 16 | T_col + reflect_v |
+| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 | 174 / 11088 | T + full D4 |
+| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 | 20 / 1792 | T + full D4 |
+| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 20 / 1792 | T + full D4 |
+| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 8 / 42 | T_col + reflect_v |
+| `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 6 | 6 / 126 | T + **D2** |
 
-Three are deliberate edge cases: a **correct** power-of-two pool on a larger 4×4
-lattice (`hop_8way_correct`); a larger interacting 4×4 system (`metropolis_4x4`);
-and a **non-translation-covariant** move (`reflect_move`) that exercises the
-covariance guard — without that guard, orbit reduction would report a *wrong*
-verdict on it (see AUDIT.md §5.3). Note how `broken_biased_direction` verifies
-only translations (its directional bias breaks D4) and the row-field cases verify
-only column translations — the reduction discovers exactly the symmetry the
-*graph* actually has.
+T = both translation generators; T_col = column translation only; D4 = full 8-element
+point group; D2 = {rotate180, reflect_h, reflect_v} (horizontal-only subgroup).
+
+The symmetry column shows exactly what the *graph* has, not what was assumed.
+`broken_biased_direction` gets `reflect_h` (column bias is symmetric under row-flip)
+but not `reflect_v` or `rotate90` (column-flip would swap the biased and unbiased
+directions). The row-field examples (`quadratic_field`, `broken_field_wrong_accept`,
+`reflect_move`) get column translation and `reflect_v` but not row-involving
+symmetries. `horizontal_metropolis` has **D2 not D4** — 90° rotation maps column
+moves to row moves, which are outside the proposal set, so `rotate90` correctly
+fails to verify while all D2 elements pass.
+
+Four are deliberate edge cases: a correct power-of-two pool on 4×4
+(`hop_8way_correct`); a larger interacting 4×4 system (`metropolis_4x4`); a
+non-translation-covariant move (`reflect_move`, see AUDIT.md §5.3); and
+**`horizontal_metropolis`** — the critical example showing that point-group
+symmetry and detailed balance are logically independent: this algorithm has D2
+symmetry (not D4) yet DB-PASS. Failing `rotate90` on the graph is *never*
+interpreted as a DB verdict.
 
 **Warm compute (JIT excluded), serial** on an Apple-silicon laptop:
 
