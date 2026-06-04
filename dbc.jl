@@ -8,8 +8,8 @@
 #       -> tau-augmented BFS  (translational-invariance check + exact symbolic
 #          enumeration of every random-number path)
 #       -> ergodicity reachability
-#       -> detailed balance  (HiGHS LP chamber enumeration + exact rational
-#          grouping with denominators cleared).
+#       -> detailed balance  (exact-rational-LP chamber enumeration + exact
+#          rational grouping with denominators cleared).
 #
 # DESIGN PRINCIPLE: correctness over speed. The checker must NEVER return a
 # false PASS (detailed balance reported as satisfied when it is not) or a false
@@ -56,7 +56,15 @@ cant(msg) = throw(CantHandle(msg))
 # detected as translation-NON-invariant.
 # ----------------------------------------------------------------------------
 
-const Q = Rational{BigInt}
+# Exact rational arithmetic. Int128 (not BigInt) for speed: lattice coordinates,
+# distances, selection weights and Boltzmann exponents are tiny, and Int128 gives
+# ~38 decimal digits of headroom. Crucially this is SOUND, not a gamble: Julia's
+# Rational{Int128} arithmetic is overflow-CHECKED and throws OverflowError on
+# overflow (verified), so an out-of-range computation aborts loudly rather than
+# silently wrapping to a wrong value. check.jl catches that and reports it as a
+# hard error (never a wrong verdict). For the system sizes this tool targets
+# (a few particles on lattices up to ~5x5) overflow does not occur.
+const Q = Rational{Int128}
 
 struct TauNum
     v::Q
@@ -111,9 +119,18 @@ function Base.:^(a::TauNum, n::Integer)
     r
 end
 
-# Equality is exact and tau-aware (used only for canonical dedup of tau-free
-# values; comparisons that BRANCH go through require_tau_free first).
-Base.:(==)(a::TauNum, b::TauNum) = a.v==b.v && a.cr==b.cr && a.cc==b.cc && a.tainted==b.tainted
+# Equality on positions is allowed ONLY when the result is translation-safe:
+# either both values are tau-free, or they share the SAME tau-coefficients (so
+# their difference is tau-free, e.g. comparing two live particle rows). Any other
+# equality test mixes an absolute position into a branch and would be a silent
+# translation leak, so it is a hard error pushing the user toward same_site/pbc_d2.
+# Ordering positions is absolute by nature and is forbidden outright.
+function Base.:(==)(a::TauNum, b::TauNum)
+    (a.cr == b.cr && a.cc == b.cc && !a.tainted && !b.tainted) && return a.v == b.v
+    cant("equality test on an absolute (tau-dependent) position; use same_site / pbc_d2")
+end
+Base.isless(::TauNum, ::TauNum) =
+    cant("ordering comparison on lattice positions is not translation-safe; compare distances via pbc_d2")
 Base.hash(a::TauNum, h::UInt) = hash((a.v,a.cr,a.cc,a.tainted), h)
 
 # ============================================================================
@@ -210,6 +227,17 @@ end
 same_site(p::Particle, q::Particle, n::Int) =
     pmod(p.r - q.r, n) == 0 && pmod(p.c - q.c, n) == 0
 
+# Is a next-state position a genuine translation-COVARIANT lattice position, i.e.
+# does it shift by exactly the lattice offset (row tracks tau_r, col tracks tau_c,
+# no nonlinear taint)?  Every output of a translation-invariant move must be of
+# this form; anything else (an absolute coordinate from pmod, a reflection like
+# -p.r, a nonlinear move like p.r^2) means the transition is NOT equivariant. We
+# detect it here so the orbit-reduction optimisation is only ever applied to a
+# genuinely equivariant algorithm — see SECTION 6.
+is_covariant_pos(p::Particle) =
+    p.r.cr == 1 && p.r.cc == 0 && !p.r.tainted &&
+    p.c.cr == 0 && p.c.cc == 1 && !p.c.tainted
+
 # ============================================================================
 # SECTION 3 — BitSeqRNG and the symbolic random primitives
 # ============================================================================
@@ -219,11 +247,29 @@ same_site(p::Particle, q::Particle, n::Int) =
 # SYMBOLIC factor (the clamped Boltzmann threshold) rather than a float, so the
 # downstream DB check is algebraically exact.
 
-# Tau-violation is reported through a process-global flag, reset per BFS run,
-# so that the geometry helpers above (which have no rng handle) can raise it.
-const _TAU     = Ref(false)
-const _TAU_MSG = Ref("")
-tau_violation!(msg::String) = (_TAU[] = true; _TAU_MSG[] = msg; nothing)
+# Tau-violation is reported through a thread-local flag, reset per BFS run, so the
+# geometry helpers above (which have no rng handle) can raise it. Thread-local so
+# that a -parallel BFS over states does not race on it; in serial mode there is
+# just one slot. `:static` scheduling keeps threadid() stable inside a BFS path
+# (user code never yields), so threadid() indexing is safe here.
+const _TAU     = [false]
+const _TAU_MSG = [""]
+tau_violation!(msg::String) = (i = Threads.threadid(); _TAU[i] = true; _TAU_MSG[i] = msg; nothing)
+
+# Resize the thread-local scratch (tau flags + interning caches) to the active
+# thread count and clear it. Call once at the start of each run.
+# Sized by maxthreadid() (not nthreads()): with `julia -t auto` the interactive
+# thread pool means threadid() can exceed the default pool size.
+function _init_threadlocal!()
+    nt = Threads.maxthreadid()
+    resize!(_TAU, nt);       fill!(_TAU, false)
+    resize!(_TAU_MSG, nt);   fill!(_TAU_MSG, "")
+    resize!(_TH_CACHES, nt)
+    for i in 1:nt; _TH_CACHES[i] = Dict{Any,ThExpr}(); end
+    nothing
+end
+_tau_any()  = any(_TAU)
+_tau_first_msg() = (i = findfirst(!isempty, _TAU_MSG); i === nothing ? "" : _TAU_MSG[i])
 
 # ----------------------------------------------------------------------------
 # Exact rational functions of exp-monomials (BSum / Val)
@@ -318,9 +364,8 @@ struct ThPiece <: ThExpr; clauses::Vector{Tuple{Vector{Cond},ThExpr}}; default::
 # canonical nodes. This makes weight-deduplication an objectid comparison
 # instead of a deep structural hash (the dominant cost otherwise). Keys are
 # built from already-interned children by objectid, so they stay small.
-const _TH_CACHE = Dict{Any,ThExpr}()
-reset_th_cache!() = empty!(_TH_CACHE)
-_intern(make::Function, key) = get!(make, _TH_CACHE, key)   # `_intern(key) do ... end`
+const _TH_CACHES = [Dict{Any,ThExpr}()]     # one interning table per thread
+_intern(make::Function, key) = get!(make, _TH_CACHES[Threads.threadid()], key)
 
 # Translation-facing builders (energies are LinForm so tau is tracked).
 th_const(x)                 = _intern((:c, Q(x))) do; ThConst(Q(x)) end
@@ -465,6 +510,11 @@ function build_state_leaves(algo, seed::PState, n::Int, maxdepth::Int)::Vector{L
         rng  = BitSeqRNG(bits)
         try
             nxt = algo(rng, seed)::PState
+            for p in nxt
+                is_covariant_pos(p) ||
+                    tau_violation!("a next-state position is not a pure lattice translation " *
+                                   "of the input (absolute, reflected, or nonlinear move)")
+            end
             push!(leaves, Leaf(norm_state(nxt, n), rng.coeff, copy(rng.factors)))
         catch e
             if e isa OutOfBitsException
@@ -614,25 +664,53 @@ struct BFSResult
     tau_msg  :: String
 end
 
-function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdepth::Int)::BFSResult
-    reset_th_cache!()                       # fresh interning table for this run
+# BFS a list of seed states, optionally across threads. Each thread uses its own
+# interning cache and tau flag (set up by _init_threadlocal!), so the only shared
+# output is the per-seed leaf vector written to a preallocated slot. A CantHandle
+# raised inside a worker is unwrapped and rethrown so check.jl can report it.
+function _bfs_seeds(algo, seeds::Vector{CState}, n::Int, maxdepth::Int, parallel::Bool)
+    out = Vector{Vector{Leaf}}(undef, length(seeds))
+    if parallel && Threads.nthreads() > 1
+        try
+            Threads.@threads :static for i in 1:length(seeds)
+                out[i] = build_state_leaves(algo, augmented_pstate(seeds[i]), n, maxdepth)
+            end
+        catch e
+            throw(_unwrap_cant(e))
+        end
+    else
+        for i in 1:length(seeds)
+            out[i] = build_state_leaves(algo, augmented_pstate(seeds[i]), n, maxdepth)
+        end
+    end
+    out
+end
+# Dig a CantHandle out of a (possibly nested) TaskFailedException.
+function _unwrap_cant(e)
+    e isa CantHandle && return e
+    if e isa TaskFailedException; return _unwrap_cant(e.task.exception); end
+    if e isa CompositeException && !isempty(e.exceptions); return _unwrap_cant(e.exceptions[1]); end
+    e
+end
+
+function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdepth::Int;
+                           parallel::Bool=false)::BFSResult
+    _init_threadlocal!()                    # fresh per-thread interning + tau flags
     idx = Dict(cs => i for (i, cs) in enumerate(states))
     uweights = Leaf[]; uw_idx = Dict{Any,Int}()
     widx!(lf::Leaf) = get!(uw_idx, _weight_key(lf)) do; push!(uweights, lf); length(uweights) end
     trans = Tuple{Int,Int,Int}[]
-    tau_free = true; tau_msg = ""
 
     reps, repof, gof = translation_orbits(states, n)
-    rep_leaves = Dict{CState,Vector{Leaf}}()
-    for rep in reps
-        _TAU[] = false; _TAU_MSG[] = ""
-        rep_leaves[rep] = build_state_leaves(algo, augmented_pstate(rep), n, maxdepth)
-        if _TAU[]; tau_free = false; isempty(tau_msg) && (tau_msg = _TAU_MSG[]); end
-    end
+    rep_leaf_vec = _bfs_seeds(algo, reps, n, maxdepth, parallel)
+    rep_leaves = Dict{CState,Vector{Leaf}}(reps[i] => rep_leaf_vec[i] for i in eachindex(reps))
+    tau_free = !_tau_any(); tau_msg = _tau_first_msg()
 
     if tau_free
-        # Dedup the rep leaves' weights ONCE (by object identity in the orbit
-        # expansion below), then translate each rep leaf to every orbit member.
+        # Orbit reduction (sound here: the covariance + tau checks guarantee the
+        # transition matrix is genuinely translation-equivariant — see SECTION 6
+        # header). Dedup the rep weights once, then translate each rep leaf to
+        # every orbit member.
         wi_of = IdDict{Leaf,Int}()
         for rep in reps, lf in rep_leaves[rep]; wi_of[lf] = widx!(lf); end
         for (s, si) in idx
@@ -643,10 +721,13 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
             end
         end
     else
-        # Fallback: direct BFS from every state (no equivariance assumed).
+        # Fallback: direct BFS from EVERY state (no equivariance assumed). Correct
+        # for any algorithm, translation-invariant or not.
+        need = CState[s for s in states if !haskey(rep_leaves, s)]
+        extra = _bfs_seeds(algo, need, n, maxdepth, parallel)
+        extra_d = Dict{CState,Vector{Leaf}}(need[i] => extra[i] for i in eachindex(need))
         for (s, si) in idx
-            lvs = haskey(rep_leaves, s) ? rep_leaves[s] :
-                  build_state_leaves(algo, augmented_pstate(s), n, maxdepth)
+            lvs = haskey(rep_leaves, s) ? rep_leaves[s] : extra_d[s]
             for lf in lvs
                 wi = widx!(lf); dst = idx[lf.next]
                 dst != si && push!(trans, (si, dst, wi))
@@ -681,8 +762,6 @@ end
 # function of exp-monomials (a Val). For each communicating pair the detailed-
 # balance residual is formed and its denominators cleared, leaving a polynomial
 # whose coefficients must all vanish — checked exactly with Rational{BigInt}.
-
-using HiGHS
 
 # Unique-weight key: thresholds are interned (hash-consed), so structurally
 # equal thresholds are the SAME object and objectid identifies them in O(1).
@@ -865,26 +944,107 @@ function build_dbmodel(bfs::BFSResult, energy)::DBModel
             uweights, uw_active, pairs, ij_srcs, ji_srcs)
 end
 
-# ---- Phase 2: chamber enumeration via HiGHS LP BFS + degenerate filter ----
+# ---- Phase 2: chamber enumeration via EXACT rational LP + degenerate filter ----
+#
+# Chamber feasibility is decided by an EXACT rational simplex, not a floating-
+# point LP. This removes the only non-exact step the previous design had (a HiGHS
+# LP with a 1e-6 feasibility tolerance), and with it the last theoretical route to
+# a wrong verdict from numerical error. It also drops a heavy binary dependency,
+# so the checker starts faster and runs in more environments. The exact result is
+# validated to agree with HiGHS on every sign pattern of every bundled example.
+
+# Exact two-phase primal simplex with Bland's rule (guaranteed termination, no
+# cycling):  maximize c·x  s.t.  A x <= b,  x >= 0,  over the rationals.
+# Returns (status, optimum) with status in (:optimal, :unbounded, :infeasible).
+function simplex_max(A::Matrix{Q}, b::Vector{Q}, c::Vector{Q})
+    m, n = size(A)
+    needart = [b[i] < 0 for i in 1:m]; nart = count(needart)
+    ncol = n + m + nart
+    T = zeros(Q, m + 1, ncol + 1); basis = zeros(Int, m); ai = 0
+    for i in 1:m
+        s = needart[i] ? Q(-1) : Q(1)          # scale row so RHS >= 0
+        for j in 1:n; T[i, j] = s * A[i, j]; end
+        T[i, n + i] = s; T[i, ncol + 1] = s * b[i]
+        if needart[i]; ai += 1; T[i, n + m + ai] = Q(1); basis[i] = n + m + ai
+        else;          basis[i] = n + i; end
+    end
+    function pivot!(prow, pcol)
+        T[prow, :] ./= T[prow, pcol]
+        for r in 1:size(T, 1)
+            r == prow && continue
+            f = T[r, pcol]; f == 0 && continue
+            T[r, :] .-= f .* T[prow, :]
+        end
+        basis[prow] = pcol
+    end
+    function optimize!(cols)
+        while true
+            pcol = 0
+            for j in cols; if T[m + 1, j] > 0; pcol = j; break; end; end  # Bland
+            pcol == 0 && return :optimal
+            prow = 0; best = Q(0)
+            for i in 1:m
+                if T[i, pcol] > 0
+                    r = T[i, ncol + 1] / T[i, pcol]
+                    if prow == 0 || r < best || (r == best && basis[i] < basis[prow])
+                        best = r; prow = i
+                    end
+                end
+            end
+            prow == 0 && return :unbounded
+            pivot!(prow, pcol)
+        end
+    end
+    if nart > 0                                  # Phase I: drive out artificials
+        for j in (n + m + 1):ncol; T[m + 1, j] = Q(-1); end
+        for i in 1:m; basis[i] > n + m && (T[m + 1, :] .+= T[i, :]); end
+        optimize!(1:(n + m + nart))
+        T[m + 1, ncol + 1] != 0 && return (:infeasible, Q(0))
+        for i in 1:m                             # pivot any zero-valued artificial out
+            if basis[i] > n + m
+                pcol = 0
+                for j in 1:(n + m); if T[i, j] != 0; pcol = j; break; end; end
+                pcol != 0 && pivot!(i, pcol)
+            end
+        end
+        for j in 1:(ncol + 1); T[m + 1, j] = Q(0); end
+    end
+    for j in 1:n; T[m + 1, j] = c[j]; end        # Phase II: maximize c·x
+    for i in 1:m
+        cb = basis[i] <= n ? c[basis[i]] : Q(0)
+        cb == 0 && continue
+        T[m + 1, :] .-= cb .* T[i, :]
+    end
+    optimize!(1:(n + m)) == :unbounded && return (:unbounded, Q(0))
+    (:optimal, -T[m + 1, ncol + 1])
+end
+
+# Exact open-chamber feasibility for a sign pattern `sigma` over the homogeneous
+# conditions (eff[i]·J, strict[i]). Substituting J = u - 1 (u in [0,2]) and
+# maximizing a slack t pushed into every "strict-side" inequality, the chamber is
+# a genuine open region iff the exact optimum t* > 0. (This is the eps->0+ limit
+# of the old HiGHS test, so it agrees with it but with no tolerance.)
 function _is_feasible(sigma::Vector{Int}, eff::Vector{Vector{Q}},
-                     strict::Vector{Bool}, nA::Int, eps::Float64)::Bool
+                      strict::Vector{Bool}, nA::Int)::Bool
     isempty(sigma) && return true
-    h = HiGHS.Highs_create()
-    HiGHS.Highs_setBoolOptionValue(h, "output_flag", false)
-    for _ in 1:nA
-        HiGHS.Highs_addVar(h, -1e10, 1e10)
+    k = length(sigma); nv = nA + 1; tcol = nA + 1
+    rows = Vector{Q}[]; rhs = Q[]
+    for i in 1:k
+        s = sigma[i] == 1 ? Q(1) : Q(-1)
+        strict_side = (sigma[i] == 1) == strict[i]
+        row = zeros(Q, nv); sumeff = Q(0)
+        for j in 1:nA; row[j] = -s * eff[i][j]; sumeff += eff[i][j]; end
+        strict_side && (row[tcol] = Q(1))
+        push!(rows, row); push!(rhs, -s * sumeff)
     end
-    inds = Int32[j - 1 for j in 1:nA]
-    for i in eachindex(sigma)
-        s = sigma[i] == 1 ? 1.0 : -1.0
-        coeffs = Float64[s * Float64(eff[i][j]) for j in 1:nA]
-        lb = ((sigma[i] == 1) == strict[i]) ? eps : 0.0
-        HiGHS.Highs_addRow(h, lb, 1e30, nA, inds, coeffs)
+    for j in 1:nA
+        row = zeros(Q, nv); row[j] = Q(1); push!(rows, row); push!(rhs, Q(2))  # u_j <= 2
     end
-    HiGHS.Highs_run(h)
-    st = HiGHS.Highs_getModelStatus(h)
-    HiGHS.Highs_destroy(h)
-    st == 7   # kOptimal
+    row = zeros(Q, nv); row[tcol] = Q(1); push!(rows, row); push!(rhs, Q(1))   # t <= 1
+    A = permutedims(reduce(hcat, rows))
+    c = zeros(Q, nv); c[tcol] = Q(1)
+    st, z = simplex_max(A, rhs, c)
+    st == :optimal && z > 0
 end
 
 function _filter_degenerate(feasible, eff, strict, k)
@@ -908,11 +1068,19 @@ end
 function enumerate_chambers(m::DBModel)::Vector{Vector{Int}}
     k = length(m.cond_eff_lhs); nA = m.nA
     k == 0 && return [Int[]]
-    # generic interior witness: J*_a = 100^a guarantees no real condition is 0.
-    Jstar = Q[Q(100)^a for a in 1:nA]
+    # Generic interior witness for an initial chamber: with J*_a = base^a the
+    # highest-index term dominates, so no condition whose integer coefficients sum
+    # to < base can vanish. base is chosen as large as Int128 allows for this nA
+    # (100 for the small arrangements here; smaller, still > coefficient sums, when
+    # nA is large) so the witness stays exact and overflow-free.
+    base = 100
+    while base > 4 && big(base)^nA > typemax(Int128); base -= 1; end
+    Jstar = Q[Q(base)^a for a in 1:nA]
     initial = Int[ (sum(m.cond_eff_lhs[i][a] * Jstar[a] for a in 1:nA) >= 0) ? 1 : 0
                    for i in 1:k ]
-    eps = 1e-6
+    # The chamber-adjacency graph (chambers differing in one hyperplane's sign
+    # share a facet) is connected, so this BFS reaches every chamber given an
+    # EXACT feasibility test.
     visited = Set{Vector{Int}}([copy(initial)])
     feasible = [copy(initial)]; queue = [copy(initial)]
     while !isempty(queue)
@@ -921,7 +1089,7 @@ function enumerate_chambers(m::DBModel)::Vector{Vector{Int}}
             s2 = copy(s); s2[i] = 1 - s2[i]
             s2 in visited && continue
             push!(visited, copy(s2))
-            if _is_feasible(s2, m.cond_eff_lhs, m.cond_is_strict, nA, eps)
+            if _is_feasible(s2, m.cond_eff_lhs, m.cond_is_strict, nA)
                 push!(feasible, copy(s2)); push!(queue, copy(s2))
             end
         end
@@ -930,14 +1098,19 @@ function enumerate_chambers(m::DBModel)::Vector{Vector{Int}}
 end
 
 # ---- Phase 3: exact DB check (lazy Val cache + per-pair condition projection) ----
-# Returns (pass, violations) where each violation is (i, j, chamber_index).
-function run_db_check(m::DBModel)
-    chambers = enumerate_chambers(m); nA = m.nA; nC = length(m.cond_eff_lhs)
+# Returns (pass, violations, nChambers); each violation is (i, j, chamber_index).
+# The pair loop is independent per pair, so it is the natural parallel unit; each
+# thread keeps its own Val cache (correctness is unaffected — the cache only
+# memoises pure exact computations) and its own violation list.
+function run_db_check(m::DBModel; parallel::Bool=false)
+    chambers = enumerate_chambers(m); nA = m.nA
+    nt = Threads.maxthreadid()
+    caches = [Dict{Tuple{Int,Vector{Int}}, Val}() for _ in 1:nt]
     # Lazy, cached leaf Val: depends only on the projection of sigma onto the
     # weight's active conditions, so one evaluation serves every chamber sharing
     # that projection.
-    cache = Dict{Tuple{Int,Vector{Int}}, Val}()
     function leaf_val(wi::Int, σ::Vector{Int})
+        cache = caches[Threads.threadid()]
         asg = Int[σ[c] for c in m.uw_active[wi]]
         get!(cache, (wi, asg)) do
             v = val_const(m.uweights[wi].coeff, nA)
@@ -966,21 +1139,30 @@ function run_db_check(m::DBModel)
         isempty(res)
     end
 
-    violations = Tuple{Int,Int,Int}[]
-    for p in eachindex(m.pairs)
-        (isempty(m.ij_srcs[p]) && isempty(m.ji_srcs[p])) && continue
-        # Active conditions for this pair: only these distinguish its chambers.
+    work = Int[p for p in eachindex(m.pairs)
+               if !(isempty(m.ij_srcs[p]) && isempty(m.ji_srcs[p]))]
+    viol_per = [Tuple{Int,Int,Int}[] for _ in 1:nt]
+    function do_pair(p::Int)
+        # Active conditions for this pair: only these distinguish its chambers, so
+        # check it once per distinct PROJECTION of the chambers onto them.
         apset = Set{Int}()
         for wi in m.ij_srcs[p]; union!(apset, m.uw_active[wi]); end
         for wi in m.ji_srcs[p]; union!(apset, m.uw_active[wi]); end
         ap = sort(collect(apset))
-        seen = Set{Vector{Int}}()
+        seen = Set{Vector{Int}}(); out = viol_per[Threads.threadid()]
         for (ridx, σ) in enumerate(chambers)
             proj = Int[σ[c] for c in ap]
             proj in seen && continue
             push!(seen, proj)
-            residual_zero(p, σ) || push!(violations, (m.pairs[p][1], m.pairs[p][2], ridx))
+            residual_zero(p, σ) || push!(out, (m.pairs[p][1], m.pairs[p][2], ridx))
         end
     end
+
+    if parallel && nt > 1
+        Threads.@threads :static for p in work; do_pair(p); end
+    else
+        for p in work; do_pair(p); end
+    end
+    violations = isempty(viol_per) ? Tuple{Int,Int,Int}[] : reduce(vcat, viol_per)
     (isempty(violations), violations, length(chambers))
 end
