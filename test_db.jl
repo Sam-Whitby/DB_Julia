@@ -67,9 +67,9 @@ end
 
 @testset "UNIT: Val engine — VMMC ratio cancels exactly" begin
     nA = 2; Lfwd = Q[1,0]; Lrev = Q[0,1]
-    wRev  = val_oneminus(val_boltz(Lrev), nA)
-    wFwd  = val_oneminus(val_boltz(Lfwd), nA)
-    ratio = Val(wRev.num, [Lfwd])
+    wRev  = val_oneminus(val_boltz(Lrev, nA), nA)
+    wFwd  = val_oneminus(val_boltz(Lfwd, nA), nA)
+    ratio = Val(wRev.num, [binom_oneminus(Lfwd, nA)])
     link  = val_mul(wFwd, ratio)
     @test bs_mul(link.num, expand_binoms(wRev.den, nA)) == bs_mul(wRev.num, expand_binoms(link.den, nA))
     D = ms_unionmax(link.den, wRev.den)
@@ -187,6 +187,8 @@ EXPECT = [
     ("metropolis_4x4",              (true,  true,  true )),   # larger lattice
     ("reflect_move",                (false, true,  false)),   # covariance guard -> fallback
     ("horizontal_metropolis",       (true,  true,  false)),   # D2 not D4; erg FAIL by design
+    ("barker_accept",               (true,  true,  true )),   # (1+exp) denominator (Tier 1)
+    ("poly_rate_accept",            (true,  true,  true )),   # polynomial weight factor (Tier 2)
 ]
 
 function _run_pipeline(n, types, algo, energy)
@@ -263,6 +265,78 @@ end
     @test hm.erg == false                                    # ergodic FAIL by design (rows fixed)
     @test hm.nreps < hm.npairs                               # D2 still gives real pair reduction
     @test hm.db == hm.db_full                                # reduced == full check
+end
+
+# ----------------------------------------------------------------------------
+# Tier 1 / Tier 2 weight classes: the new (1+exp) denominators, polynomial-
+# coefficient weights, and th_max. Each is checked in BOTH directions — a correct
+# instance must PASS, a deliberately broken one must be CAUGHT — so the extensions
+# cannot introduce a false PASS.
+@testset "Tier1/Tier2 weight classes: PASS verified, FAIL caught" begin
+    n = 3; energy = mk_energy(n, 2); states = enumerate_states([1,2,3], n)
+    runDB(step) = run_db_check(build_dbmodel(build_transitions(step, energy, states, n, 30), energy))[1]
+    negf(lf) = LinForm(a => -c for (a, c) in lf)
+    base(np_fn) = (rng, st::PState) -> begin
+        i = rand_choice_index!(rng, length(st)); p = st[i]
+        (dr, dc) = rand_choice!(rng, DISPS8); np = Particle(p.r + dr, p.c + dc, p.t)
+        rest = st[setdiff(1:length(st), i)]
+        for q in rest; same_site(q, np, n) && return st; end
+        np_fn(rng, st, rest, np)
+    end
+
+    # (1+exp) denominator — Barker acceptance.  Correct => PASS.
+    barker = base((rng, st, rest, np) -> begin
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        accept!(rng, th_div(th_const(1), th_add(th_const(1), th_boltz(negf(dE))))) ? ns : st
+    end)
+    @test runDB(barker)
+    # Broken Barker (half exponent) => must be caught.
+    barker_half = base((rng, st, rest, np) -> begin
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        h = LinForm(a => c*(1//2) for (a, c) in dE)
+        accept!(rng, th_div(th_const(1), th_add(th_const(1), th_boltz(negf(h))))) ? ns : st
+    end)
+    @test !runDB(barker_half)
+
+    # Polynomial-coefficient weight — a rate factor `a`.  Correct => PASS.
+    rate() = th_linear(LinForm(Xparam(:a) => TauNum(1)))
+    poly_ok = base((rng, st, rest, np) -> begin
+        accept!(rng, rate()) || return st
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        metropolis!(rng, dE) ? ns : st
+    end)
+    @test runDB(poly_ok)
+    # Broken polynomial: duplicate one direction so the rate-weighted forward and
+    # reverse differ.  The residual is a NON-zero polynomial in `a` => must be caught.
+    biased = [(0,1),(0,1),(0,-1),(1,0),(-1,0),(1,1),(1,-1),(-1,1),(-1,-1)]
+    poly_bad = (rng, st::PState) -> begin
+        i = rand_choice_index!(rng, length(st)); p = st[i]
+        (dr, dc) = rand_choice!(rng, biased); np = Particle(p.r + dr, p.c + dc, p.t)
+        rest = st[setdiff(1:length(st), i)]
+        for q in rest; same_site(q, np, n) && return st; end
+        accept!(rng, rate()) || return st
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        metropolis!(rng, dE) ? ns : st
+    end
+    @test !runDB(poly_bad)
+end
+
+@testset "th_max selects the complementary branch to th_min" begin
+    _init_threadlocal!()
+    A1 = Atom(true,1,1,1,:_); A2 = Atom(true,2,2,1,:_)
+    a = th_boltz(LinForm(A1 => TauNum(1))); b = th_boltz(LinForm(A2 => TauNum(1)))
+    mn = th_min(a, b); mx = th_max(a, b)
+    aidx = Dict(A1 => 1, A2 => 2); nA = 2
+    @test min_condition(a, b, aidx, nA) !== nothing            # switch is a genuine hyperplane
+    ctx = (cidx = Dict{Tuple{Vector{Q},Bool},Int}(),
+           thmin = Dict(objectid(mn) => 1, objectid(mx) => 1))  # sigma[1]==1 iff a<b
+    va = eval_static(a, aidx, nA); vb = eval_static(b, aidx, nA)
+    for σ in ([0], [1])
+        vmin = eval_val(mn, σ, ctx, aidx, nA)
+        vmax = eval_val(mx, σ, ctx, aidx, nA)
+        @test vmin.num != vmax.num                             # they pick different operands
+        @test val_add(vmin, vmax, nA).num == val_add(va, vb, nA).num   # min + max == a + b
+    end
 end
 
 end

@@ -282,51 +282,97 @@ _tau_first_msg() = (i = findfirst(!isempty, _TAU_MSG); i === nothing ? "" : _TAU
 # multiset of binomials (1 - exp(-beta*L_k)).  Denominators are only ever
 # products of such binomials, so the representation is closed and the DB check
 # clears denominators exactly (the residual is a plain polynomial).
-const ExpVec = Vector{Q}                  # exponent L over the global atom list
-const BSum   = Dict{ExpVec, Q}            # sum_L coeff * exp(-beta * (L.J))
+const ExpVec = Vector{Q}                  # exponent L (linear in atoms) of exp(-beta L.J)
+const Mono   = Vector{Int}                # monomial: integer power of each atom
+const Poly   = Dict{Mono, Q}             # polynomial in the atoms (rational coeffs)
+const BSum   = Dict{ExpVec, Poly}        # sum_L  poly_L(J) * exp(-beta L.J)
 
-function bs_add!(s::BSum, L::ExpVec, c::Q)
-    c == 0 && return s
-    v = get(s, L, Q(0)) + c
-    v == 0 ? delete!(s, L) : (s[L] = v); s
+# ----------------------------------------------------------------------------
+# Poly: the weight-coefficient ring.  Originally coefficients were rationals (Q);
+# they are now multivariate polynomials in the coupling atoms so that weights may
+# carry bare-coupling factors (e.g. a rate proportional to a field). A constant
+# rational c is the degree-0 polynomial. The DB residual reduces to a sum
+# sum_v p_v(J) exp(-beta v.J); distinct exp-monomials are linearly independent, so
+# the residual vanishes on an open chamber iff every coefficient polynomial p_v is
+# identically zero -- i.e. iff its Dict is empty after cancellation. That keeps the
+# check exact: "all p_v == 0" is just "every monomial coefficient is 0 in Q".
+# ----------------------------------------------------------------------------
+poly_iszero(p::Poly) = isempty(p)
+poly_const(c::Q, nA::Int) = c == 0 ? Poly() : Poly(zeros(Int, nA) => c)
+function poly_add!(p::Poly, m::Mono, c::Q)
+    c == 0 && return p
+    v = get(p, m, Q(0)) + c
+    v == 0 ? delete!(p, m) : (p[m] = v); p
 end
-bs_const(c::Q, nA::Int) = c == 0 ? BSum() : BSum(zeros(Q, nA) => c)
-bs_addsum(a::BSum, b::BSum) = (r = copy(a); for (L,c) in b; bs_add!(r,L,c); end; r)
-bs_sub(a::BSum, b::BSum)    = (r = copy(a); for (L,c) in b; bs_add!(r,L,-c); end; r)
+poly_add(a::Poly, b::Poly) = (r = copy(a); for (m,c) in b; poly_add!(r,m,c); end; r)
+poly_neg(p::Poly) = Poly(m => -c for (m,c) in p)
+function poly_mul(a::Poly, b::Poly)
+    (isempty(a) || isempty(b)) && return Poly()
+    r = Poly(); for (ma,ca) in a, (mb,cb) in b; poly_add!(r, ma .+ mb, ca*cb); end; r
+end
+# (is p a degree-0 constant?, its value) -- a polynomial is constant iff its only
+# monomial is the all-zero one.
+poly_isconst(p::Poly) = isempty(p) ? (true, Q(0)) :
+    (length(p) == 1 && all(==(0), first(keys(p)))) ? (true, first(values(p))) : (false, Q(0))
+# the degree-1 polynomial  sum_a L[a] * J_a
+function poly_linear(L::ExpVec, nA::Int)
+    p = Poly()
+    for a in 1:nA
+        L[a] == 0 && continue
+        m = zeros(Int, nA); m[a] = 1; p[m] = L[a]
+    end
+    p
+end
+
+# ---- BSum: Laurent polynomial in exp-monomials, Poly coefficients ----
+function bs_add!(s::BSum, L::ExpVec, p::Poly)
+    poly_iszero(p) && return s
+    q = haskey(s, L) ? poly_add(s[L], p) : copy(p)
+    poly_iszero(q) ? delete!(s, L) : (s[L] = q); s
+end
+bs_const(c::Q, nA::Int) = c == 0 ? BSum() : BSum(zeros(Q, nA) => poly_const(c, nA))
+bs_poly(p::Poly, nA::Int) = poly_iszero(p) ? BSum() : BSum(zeros(Q, nA) => p)  # pure polynomial
+bs_addsum(a::BSum, b::BSum) = (r = copy(a); for (L,p) in b; bs_add!(r,L,p); end; r)
+bs_sub(a::BSum, b::BSum)    = (r = copy(a); for (L,p) in b; bs_add!(r,L,poly_neg(p)); end; r)
 function bs_mul(a::BSum, b::BSum)
     r = BSum()
-    for (La,ca) in a, (Lb,cb) in b; bs_add!(r, La .+ Lb, ca*cb); end
+    for (La,pa) in a, (Lb,pb) in b; bs_add!(r, La .+ Lb, poly_mul(pa,pb)); end
     r
 end
-bs_shift(a::BSum, E::ExpVec) = BSum((L .+ E) => c for (L,c) in a)
+bs_shift(a::BSum, E::ExpVec) = BSum((L .+ E) => copy(p) for (L,p) in a)
 
+# Val = num / prod(den), where each den factor is itself a BSum (a binomial such as
+# 1 - exp(-beta L) or 1 + exp(-beta L), or any 1- or 2-term exp-polynomial with
+# CONSTANT coefficients). Storing the factor explicitly (not just L) is what lets
+# the engine divide by 1+exp (Barker/Glauber) and other sign-definite binomials.
 struct Val
     num::BSum
-    den::Vector{ExpVec}       # multiset of L_k ; den = prod (1 - exp(-beta*L_k))
+    den::Vector{BSum}
 end
-val_const(c::Q, nA::Int) = Val(bs_const(c, nA), ExpVec[])
-val_boltz(L::ExpVec)     = Val(BSum(copy(L) => Q(1)), ExpVec[])    # exp(-beta*L)
-val_mul(a::Val, b::Val)  = Val(bs_mul(a.num, b.num), vcat(a.den, b.den))
+val_const(c::Q, nA::Int)  = Val(bs_const(c, nA), BSum[])
+val_boltz(L::ExpVec, nA::Int) = Val(BSum(copy(L) => poly_const(Q(1), nA)), BSum[])  # exp(-beta L)
+val_linear(L::ExpVec, nA::Int) = Val(bs_poly(poly_linear(L, nA), nA), BSum[])       # <L, J>
+val_mul(a::Val, b::Val)   = Val(bs_mul(a.num, b.num), vcat(a.den, b.den))
 
-function expand_binoms(dens::Vector{ExpVec}, nA::Int)
-    acc = bs_const(Q(1), nA)
-    for L in dens
-        acc = bs_mul(acc, BSum(zeros(Q,nA) => Q(1), copy(L) => Q(-1)))
-    end
-    acc
-end
+# The binomial factor 1 - exp(-beta L) (the classic VMMC denominator).
+binom_oneminus(L::ExpVec, nA::Int) =
+    BSum(zeros(Q, nA) => poly_const(Q(1), nA), copy(L) => poly_const(Q(-1), nA))
+
+expand_binoms(dens::Vector{BSum}, nA::Int) =
+    (acc = bs_const(Q(1), nA); for f in dens; acc = bs_mul(acc, f); end; acc)
 val_oneminus(v::Val, nA::Int) = Val(bs_sub(expand_binoms(v.den, nA), v.num), copy(v.den))
 
-function ms_unionmax(a::Vector{ExpVec}, b::Vector{ExpVec})
-    cnt = Dict{ExpVec,Int}()
-    for L in a; cnt[L] = max(get(cnt,L,0), count(==(L), a)); end
-    for L in b; cnt[L] = max(get(cnt,L,0), count(==(L), b)); end
-    out = ExpVec[]; for (L,k) in cnt, _ in 1:k; push!(out,L); end; out
+# multiset union (max multiplicity) / difference over den factors (BSums, by value)
+function ms_unionmax(a::Vector{BSum}, b::Vector{BSum})
+    cnt = Dict{BSum,Int}()
+    for f in a; cnt[f] = max(get(cnt,f,0), count(==(f), a)); end
+    for f in b; cnt[f] = max(get(cnt,f,0), count(==(f), b)); end
+    out = BSum[]; for (f,k) in cnt, _ in 1:k; push!(out, f); end; out
 end
-function ms_diff(big::Vector{ExpVec}, small::Vector{ExpVec})
+function ms_diff(big::Vector{BSum}, small::Vector{BSum})
     rem = copy(big)
-    for L in small
-        i = findfirst(==(L), rem); i === nothing && cant("denominator multiset diff failed"); deleteat!(rem, i)
+    for f in small
+        i = findfirst(==(f), rem); i === nothing && cant("denominator multiset diff failed"); deleteat!(rem, i)
     end
     rem
 end
@@ -353,11 +399,13 @@ tau0_checked(lf::LinForm)::RatForm =
     (any_tau_dep(lf) && tau_violation!("a threshold/condition depends on an absolute (tau-dependent) position"); tau0_form(lf))
 
 abstract type ThExpr end
-struct ThConst <: ThExpr; c::Q; end
-struct ThBoltz <: ThExpr; L::RatForm; end                 # exp(-beta * L)
-struct ThOp    <: ThExpr; op::Symbol; a::ThExpr; b::ThExpr; end   # :+,:-,:*,:/
-struct ThMin   <: ThExpr; a::ThExpr; b::ThExpr; end
-struct ThPiece <: ThExpr; clauses::Vector{Tuple{Vector{Cond},ThExpr}}; default::ThExpr; end
+struct ThConst  <: ThExpr; c::Q; end
+struct ThBoltz  <: ThExpr; L::RatForm; end                 # exp(-beta * L)
+struct ThLinear <: ThExpr; L::RatForm; end                 # the bare value <L, J> (polynomial weight)
+struct ThOp     <: ThExpr; op::Symbol; a::ThExpr; b::ThExpr; end   # :+,:-,:*,:/
+struct ThMin    <: ThExpr; a::ThExpr; b::ThExpr; end
+struct ThMax    <: ThExpr; a::ThExpr; b::ThExpr; end
+struct ThPiece  <: ThExpr; clauses::Vector{Tuple{Vector{Cond},ThExpr}}; default::ThExpr; end
 
 # Hash-consing (interning): structurally-equal thresholds share ONE object, so
 # the millions of thresholds built during the BFS collapse to a few thousand
@@ -370,11 +418,13 @@ _intern(make::Function, key) = get!(make, _TH_CACHES[Threads.threadid()], key)
 # Translation-facing builders (energies are LinForm so tau is tracked).
 th_const(x)                 = _intern((:c, Q(x))) do; ThConst(Q(x)) end
 th_boltz(L::LinForm)        = (rl = tau0_checked(L); _intern((:b, _form_key(rl))) do; ThBoltz(rl) end)
+th_linear(L::LinForm)       = (rl = tau0_checked(L); _intern((:lin, _form_key(rl))) do; ThLinear(rl) end)
 th_add(a::ThExpr,b::ThExpr) = _intern((:op,:+,objectid(a),objectid(b))) do; ThOp(:+,a,b) end
 th_sub(a::ThExpr,b::ThExpr) = _intern((:op,:-,objectid(a),objectid(b))) do; ThOp(:-,a,b) end
 th_mul(a::ThExpr,b::ThExpr) = _intern((:op,:*,objectid(a),objectid(b))) do; ThOp(:*,a,b) end
 th_div(a::ThExpr,b::ThExpr) = _intern((:op,:/,objectid(a),objectid(b))) do; ThOp(:/,a,b) end
 th_min(a::ThExpr,b::ThExpr) = _intern((:min,objectid(a),objectid(b))) do; ThMin(a,b) end
+th_max(a::ThExpr,b::ThExpr) = _intern((:max,objectid(a),objectid(b))) do; ThMax(a,b) end
 c_lt(a::LinForm,b::LinForm) = Cond(tau0_checked(linsub(a,b)), true)   # a < b
 c_le(a::LinForm)            = Cond(tau0_checked(a), false)            # a <= 0
 
@@ -540,10 +590,12 @@ _guard_true(c::Cond, J) = c.strict ? _rfval(c.lhs,J) < 0 : _rfval(c.lhs,J) <= 0
 function eval_th_float(t::ThExpr, J::Dict{Atom,Float64}, beta::Float64)::Float64
     if t isa ThConst; Float64(t.c)
     elseif t isa ThBoltz; exp(-beta * _rfval(t.L, J))
+    elseif t isa ThLinear; _rfval(t.L, J)
     elseif t isa ThOp
         a = eval_th_float(t.a,J,beta); b = eval_th_float(t.b,J,beta)
         t.op === :+ ? a+b : t.op === :- ? a-b : t.op === :* ? a*b : a/b
     elseif t isa ThMin; min(eval_th_float(t.a,J,beta), eval_th_float(t.b,J,beta))
+    elseif t isa ThMax; max(eval_th_float(t.a,J,beta), eval_th_float(t.b,J,beta))
     else  # ThPiece
         for (guards,val) in t.clauses
             all(_guard_true(g,J) for g in guards) && return eval_th_float(val,J,beta)
@@ -807,8 +859,9 @@ vecof(f::RatForm, aidx::Dict{Atom,Int}, nA::Int) =
 function _collect_atoms_th!(set::Set{Atom}, t::ThExpr)
     if t isa ThConst
     elseif t isa ThBoltz; for a in keys(t.L); push!(set,a); end
+    elseif t isa ThLinear; for a in keys(t.L); push!(set,a); end
     elseif t isa ThOp; _collect_atoms_th!(set,t.a); _collect_atoms_th!(set,t.b)
-    elseif t isa ThMin; _collect_atoms_th!(set,t.a); _collect_atoms_th!(set,t.b)
+    elseif t isa ThMin || t isa ThMax; _collect_atoms_th!(set,t.a); _collect_atoms_th!(set,t.b)
     else; for (gs,v) in t.clauses; for g in gs, a in keys(g.lhs); push!(set,a); end; _collect_atoms_th!(set,v); end; _collect_atoms_th!(set,t.default)
     end
 end
@@ -818,13 +871,14 @@ end
 # themselves contain conditions (true for VMMC; fail-loud otherwise).
 function eval_static(t::ThExpr, aidx, nA)::Val
     if t isa ThConst; val_const(t.c, nA)
-    elseif t isa ThBoltz; val_boltz(to_vec(t.L, aidx, nA))
+    elseif t isa ThBoltz; val_boltz(to_vec(t.L, aidx, nA), nA)
+    elseif t isa ThLinear; val_linear(to_vec(t.L, aidx, nA), nA)
     elseif t isa ThOp
         a = eval_static(t.a,aidx,nA); b = eval_static(t.b,aidx,nA)
         t.op === :+ ? val_add(a,b,nA) : t.op === :- ? val_sub(a,b,nA) :
         t.op === :* ? val_mul(a,b)    : val_div(a,b)
     else
-        cant("Min over a condition-bearing expression is not supported")
+        cant("Min/Max over a condition-bearing expression is not supported (nested min/max)")
     end
 end
 
@@ -845,9 +899,11 @@ function min_condition(a::ThExpr, b::ThExpr, aidx, nA)
     numer = bs_sub(bs_mul(va.num, expand_binoms(vb.den, nA)),
                    bs_mul(vb.num, expand_binoms(va.den, nA)))   # numerator of (a-b)
     isempty(numer) && return nothing                            # a == b, no condition
-    length(numer) == 2 || cant("Min condition is not a linear hyperplane (numerator has $(length(numer)) terms)")
-    (k1,c1),(k2,c2) = collect(numer)
-    c1 == -c2 || cant("Min condition numerator is an unbalanced binomial (not a hyperplane)")
+    length(numer) == 2 || cant("Min/Max condition is not a linear hyperplane (numerator has $(length(numer)) exp-terms)")
+    (k1,p1),(k2,p2) = collect(numer)
+    o1,c1 = poly_isconst(p1); o2,c2 = poly_isconst(p2)
+    (o1 && o2) || cant("Min/Max condition has a non-constant (polynomial) coefficient — switch is not a hyperplane")
+    c1 == -c2 || cant("Min/Max condition numerator is an unbalanced binomial (not a hyperplane)")
     kp, km = c1 > 0 ? (k1,k2) : (k2,k1)                         # +coeff key, -coeff key
     # a<b  <=>  numer<0  <=>  exp(-b*kp) < exp(-b*km)  <=>  kp>km  <=>  (km-kp)<0
     eff = kp .- km                                              # sigma=1 (a<b) iff eff.J > 0
@@ -857,15 +913,20 @@ end
 # ---- exact Val evaluation of a ThExpr under a chamber sign pattern ----
 function eval_val(t::ThExpr, σ::Vector{Int}, ctx, aidx, nA)::Val
     if t isa ThConst; val_const(t.c, nA)
-    elseif t isa ThBoltz; val_boltz(to_vec(t.L, aidx, nA))
+    elseif t isa ThBoltz; val_boltz(to_vec(t.L, aidx, nA), nA)
+    elseif t isa ThLinear; val_linear(to_vec(t.L, aidx, nA), nA)
     elseif t isa ThOp
         a = eval_val(t.a,σ,ctx,aidx,nA); b = eval_val(t.b,σ,ctx,aidx,nA)
         t.op === :+ ? val_add(a,b,nA) : t.op === :- ? val_sub(a,b,nA) :
         t.op === :* ? val_mul(a,b)    : val_div(a,b)
     elseif t isa ThMin
-        idx = ctx.thmin[objectid(t)]
+        idx = ctx.thmin[objectid(t)]                            # sigma=1 iff a<b
         idx == 0 ? eval_val(t.a,σ,ctx,aidx,nA) :                 # a==b
             (σ[idx]==1 ? eval_val(t.a,σ,ctx,aidx,nA) : eval_val(t.b,σ,ctx,aidx,nA))
+    elseif t isa ThMax
+        idx = ctx.thmin[objectid(t)]                            # sigma=1 iff a<b -> max=b
+        idx == 0 ? eval_val(t.a,σ,ctx,aidx,nA) :
+            (σ[idx]==1 ? eval_val(t.b,σ,ctx,aidx,nA) : eval_val(t.a,σ,ctx,aidx,nA))
     else  # ThPiece
         for (gs,v) in t.clauses
             all(σ[ctx.cidx[(-vecof(g.lhs,aidx,nA), g.strict)]]==1 for g in gs) &&
@@ -881,16 +942,25 @@ val_add(a::Val,b::Val,nA) = (D=ms_unionmax(a.den,b.den);
 val_sub(a::Val,b::Val,nA) = (D=ms_unionmax(a.den,b.den);
     Val(bs_sub(bs_mul(a.num,expand_binoms(ms_diff(D,a.den),nA)),
                bs_mul(b.num,expand_binoms(ms_diff(D,b.den),nA))), D))
-# a / b  where b must be a single binomial (1 - exp(-beta*L)).
+# a / b  where b must be a denominator-free 1- or 2-term exp-polynomial with
+# CONSTANT (rational) coefficients -- e.g. 1 - exp(-bL) (VMMC), 1 + exp(-bL)
+# (Barker/Glauber), 2 - exp(-bL), or a single exp-monomial. The whole binomial
+# factor b.num is recorded in the denominator multiset; the DB residual later
+# clears it exactly. Soundness does not depend on b being sign-definite: the
+# residual is multiplied through by the common denominator and the resulting
+# exp-polynomial is tested for being identically zero, which (by continuity of the
+# transition probabilities) is equivalent to detailed balance whatever the
+# denominator -- a non-constant coefficient or >2 terms is still rejected because
+# the engine only represents binomial denominators.
 function val_div(a::Val, b::Val)
-    isempty(b.den) && length(b.num)==2 || cant("division by a non-binomial threshold")
-    z = nothing; L = nothing
-    for (k,c) in b.num
-        if all(==(0), k); c==1 || cant("bad binomial numerator"); z=k
-        else; c==-1 || cant("bad binomial numerator"); L=k; end
+    isempty(b.den) || cant("division by a thresholded value that itself has a denominator")
+    n = length(b.num)
+    (1 <= n <= 2) || cant("division by a non-binomial threshold ($n exp-terms; only 1 or 2 supported)")
+    for (_, p) in b.num
+        ok, _ = poly_isconst(p)
+        ok || cant("division by a threshold with a non-constant (polynomial) coefficient")
     end
-    (z===nothing || L===nothing) && cant("division denominator is not (1 - exp)")
-    Val(a.num, vcat(a.den, [L]))
+    Val(a.num, vcat(a.den, [deepcopy(b.num)]))
 end
 
 # ---- the DB model ----
@@ -1011,10 +1081,10 @@ function build_dbmodel(bfs::BFSResult, energy)::DBModel
     register!(eff::Vector{Q}, strict::Bool) = get!(cidx, (eff,strict)) do
         push!(eff_list, eff); push!(strict_list, strict); length(eff_list)
     end
-    thmin = Dict{UInt,Int}()                       # ThMin objectid -> cond index (0 = a==b)
+    thmin = Dict{UInt,Int}()                       # ThMin/ThMax objectid -> cond index (0 = a==b)
     function scan!(t::ThExpr)
         if t isa ThOp; scan!(t.a); scan!(t.b)
-        elseif t isa ThMin
+        elseif t isa ThMin || t isa ThMax          # both switch on the a<b hyperplane
             if !haskey(thmin, objectid(t))     # shared interned node: derive once
                 mc = min_condition(t.a, t.b, aidx, nA)
                 thmin[objectid(t)] = mc === nothing ? 0 : register!(-mc[1], mc[2])  # sigma=1 iff a<b
@@ -1038,7 +1108,7 @@ function build_dbmodel(bfs::BFSResult, energy)::DBModel
     # --- per unique weight: active conds ---
     function factor_conds(t::ThExpr, acc::Set{Int})
         if t isa ThOp; factor_conds(t.a,acc); factor_conds(t.b,acc)
-        elseif t isa ThMin; (i=thmin[objectid(t)]; i!=0 && push!(acc,i)); factor_conds(t.a,acc); factor_conds(t.b,acc)
+        elseif t isa ThMin || t isa ThMax; (i=thmin[objectid(t)]; i!=0 && push!(acc,i)); factor_conds(t.a,acc); factor_conds(t.b,acc)
         elseif t isa ThPiece
             for (gs,v) in t.clauses; for g in gs; push!(acc, cidx[(-vecof(g.lhs,aidx,nA),g.strict)]); end; factor_conds(v,acc); end
             factor_conds(t.default,acc)
@@ -1243,7 +1313,7 @@ function run_db_check(m::DBModel; parallel::Bool=false, use_symmetry::Bool=true)
     # Residual numerator for one pair under one chamber (denominators cleared).
     function residual_zero(p::Int, σ::Vector{Int})
         i, j = m.pairs[p]; ei = m.energy_coeffs[i]; ej = m.energy_coeffs[j]
-        D = ExpVec[]
+        D = BSum[]
         for wi in m.ij_srcs[p]; D = ms_unionmax(D, leaf_val(wi,σ).den); end
         for wi in m.ji_srcs[p]; D = ms_unionmax(D, leaf_val(wi,σ).den); end
         res = BSum()
@@ -1253,7 +1323,7 @@ function run_db_check(m::DBModel; parallel::Bool=false, use_symmetry::Bool=true)
         end
         for wi in m.ji_srcs[p]
             v = leaf_val(wi,σ)
-            for (L,c) in bs_mul(bs_shift(v.num, ej), expand_binoms(ms_diff(D,v.den), nA)); bs_add!(res,L,-c); end
+            for (L,c) in bs_mul(bs_shift(v.num, ej), expand_binoms(ms_diff(D,v.den), nA)); bs_add!(res,L,poly_neg(c)); end
         end
         isempty(res)
     end

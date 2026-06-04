@@ -71,7 +71,10 @@ end
 #   accept!(rng, thr)            accept with a custom symbolic threshold thr
 #
 # For custom thresholds (cluster algorithms etc.) build `thr` with th_const,
-# th_boltz, th_sub, th_div, th_min, th_piece, c_lt, c_le — see vmmc_2d.jl.
+# th_boltz, th_sub, th_div, th_min, th_max, th_piece, c_lt, c_le — see vmmc_2d.jl.
+# th_div may divide by 1+exp as well as 1-exp (Barker/Glauber — see barker_accept.jl);
+# th_linear(L) is the bare value <L,J>, so a weight can carry a coupling/rate factor
+# (see poly_rate_accept.jl).
 #
 # Build a moved particle with plain arithmetic: `Particle(p.r + dr, p.c + dc, p.t)`.
 # Do NOT wrap coordinates into the box yourself; the checker normalises the

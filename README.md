@@ -91,9 +91,16 @@ the next state with plain arithmetic — the harness wraps it onto the torus for
 | `rand_integer!(rng, lo, hi)` | uniform integer in `[lo,hi]`, exact rejection sampling |
 | `metropolis!(rng, dE)` | accept w.p. `min(1, exp(-β·dE))`; `dE::LinForm` |
 | `accept!(rng, thr)` | accept w.p. a general symbolic threshold `thr::ThExpr` |
-| `th_const, th_boltz, th_sub, th_div, th_min, th_piece, c_lt, c_le` | build symbolic thresholds (for cluster algorithms like VMMC) |
+| `th_const, th_boltz, th_linear, th_sub, th_div, th_min, th_max, th_piece, c_lt, c_le` | build symbolic thresholds (for cluster/Barker/rate algorithms) |
 | `pbc_d2(p,q,n)` / `same_site(p,q,n)` / `pmod(x,n)` | min-image distance² / occupancy / `Mod` (all τ-checked) |
 | `Jc(a,b,d2)` / `Xparam(:fieldH)` | a coupling atom `couplingJ[a,b,d2]` (canonical `a≤b`) / a field parameter |
+
+The threshold algebra handles: `exp(-β·linear)` and Laurent polynomials in such
+exp-monomials; **`th_linear(L)`** — the bare value `⟨L,J⟩`, so weights may carry
+**polynomial-in-coupling factors** (e.g. a rate proportional to a field); division
+by any binomial denominator including **`1+exp`** (Barker/Glauber) as well as
+`1-exp` (VMMC); and `th_min`/`th_max` whose switch is a single hyperplane. See
+[doc/expressiveness.md](doc/expressiveness.md) for the exact supported class.
 
 Translational invariance is **always reported**; it does not by itself fail the
 run (an absolute-field algorithm like `quadratic_field` is correctly τ-FAIL yet
@@ -241,6 +248,8 @@ verified: T = translations, D4 = full point group, T_c = column translations onl
 | `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 20 / 1792 | T + full D4 |
 | `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 8 / 42 | T_col + reflect_v |
 | `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 6 | 6 / 126 | T + **D2** |
+| `barker_accept.jl` | PASS | PASS | PASS | 504 | 1 | 72 / 4536 | T + full D4 |
+| `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 48 | 72 / 4536 | T + full D4 |
 
 T = both translation generators; T_col = column translation only; D4 = full 8-element
 point group; D2 = {rotate180, reflect_h, reflect_v} (horizontal-only subgroup).
@@ -262,20 +271,28 @@ symmetry and detailed balance are logically independent: this algorithm has D2
 symmetry (not D4) yet DB-PASS. Failing `rotate90` on the graph is *never*
 interpreted as a DB verdict.
 
+`barker_accept` and `poly_rate_accept` exercise the extended weight algebra: Barker
+acceptance uses a `1+exp` denominator (no conditions, so a single chamber), and the
+rate-limited Metropolis carries a polynomial coupling factor (`a`, the 7th atom)
+times the Boltzmann exponentials.
+
 **Warm compute (JIT excluded), serial** on an Apple-silicon laptop:
 
 | Example | BFS | model | DB check | total |
 |---|---|---|---|---|
-| `single_metropolis.jl` | 0.19 s | 0.01 s | 1.27 s | ≈ 1.5 s |
+| `single_metropolis.jl` | 0.2 s | 0.01 s | 1.2 s | ≈ 1.5 s |
 | `metropolis_4x4.jl` | 0.04 s | 0.01 s | 0.27 s | ≈ 0.3 s |
-| `vmmc_2d.jl` | 3.2 s | 0.05 s | 0.97 s | ≈ 4.2 s |
+| `barker_accept.jl` | 0.2 s | 0.02 s | ~0 s | ≈ 0.2 s |
+| `poly_rate_accept.jl` | 0.4 s | 0.02 s | 1.2 s | ≈ 1.6 s |
+| `vmmc_2d.jl` | 3.3 s | 0.06 s | 1.1 s | ≈ 4.4 s |
 
-The graph-verified symmetry reduction makes the VMMC DB check ≈2.1× faster (0.97 s
-vs 2.08 s checking all pairs). With `-parallel` on 8 threads the VMMC BFS drops to
-≈1 s. A single cold `check.jl` invocation additionally pays **~13–18 s of Julia JIT
-compilation** (the engine is recompiled per process); the regression suite
-amortises this across all examples, and a `PackageCompiler.jl` system image removes
-it entirely (below).
+The polynomial-coefficient ring and `1+exp` denominators add no measurable cost to
+the existing cases (constant coefficients take a fast path). The graph-verified
+symmetry reduction makes the VMMC DB check ≈2× faster (≈1.1 s vs ≈2.1 s checking all
+pairs). With `-parallel` on 8 threads the VMMC BFS drops to ≈1 s. A single cold
+`check.jl` invocation additionally pays **~13–18 s of Julia JIT compilation** (the
+engine is recompiled per process); the regression suite amortises this across all
+examples, and a `PackageCompiler.jl` system image removes it entirely (below).
 
 ### Removing the JIT warm-up (optional)
 Most of the wall-clock for the small cases is Julia compiling the engine afresh

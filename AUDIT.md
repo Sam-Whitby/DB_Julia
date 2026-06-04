@@ -325,3 +325,35 @@ test case: column-only Metropolis has D2 symmetry (verified: rotate180, reflect_
 reflect_v) but not D4 (rotate90 maps column moves to row moves, outside the proposal
 set, so it correctly fails verification), yet DB PASS -- confirming that
 point-group symmetry and detailed balance are independent in both directions.
+
+### 5.11 Extended weight algebra: polynomial coefficients, 1+exp denominators, max (Tier 1/2)
+
+The exact-weight class (AUDIT §2.5 / doc/expressiveness.md) was widened along the
+"easy/moderate, provably sound" directions, leaving the two exactness pillars
+intact (exp-monomial linear independence; linear-condition chambers):
+
+- **Coefficient ring ℚ → ℚ[J] (`Poly`).** Weight coefficients are now multivariate
+  polynomials in the couplings, authored via the new `th_linear(L)` (the bare value
+  ⟨L,J⟩). The DB residual reduces to Σ_v p_v(J)·exp(−β⟨v,J⟩); since distinct
+  exp-monomials are independent and a polynomial vanishing on an open chamber is
+  identically zero, the check is still exact ("every coefficient polynomial is the
+  zero polynomial"). Constant coefficients take a fast path, so the existing cases
+  are not measurably slowed (suite ~unchanged; VMMC warm ≈4.4 s).
+- **Denominators generalised** from ∏(1−exp) to any 1–2-term constant-coefficient
+  binomial (`val_div`), e.g. 1+exp (Barker/Glauber). The binomial factor is stored
+  explicitly. Clearing it in the residual is sound for ANY binomial (continuity of
+  the transition probabilities makes N≡0 ⟺ DB regardless of where the denominator
+  vanishes); the engine simply restricts to binomials because that is all it
+  represents.
+- **`th_max`** added (mirror of `th_min`; same hyperplane switch, complementary
+  branch).
+
+Two new examples exercise these (`barker_accept.jl` → 1+exp; `poly_rate_accept.jl`
+→ polynomial factor × Boltzmann). The suite (177 tests) verifies each new class in
+BOTH directions: a correct instance PASSes and a deliberately broken one is CAUGHT
+(broken Barker with a half-exponent; a polynomial-weighted move with a duplicated
+direction), so the extensions cannot introduce a false PASS. Deferred (documented
+in expressiveness.md §6): algebraic constants and many-body atom constructors
+(low value / need the number-field core), and full nested-min (only condition-free
+min/max operands are handled). Non-linear exponents/conditions and trig fields
+remain Tier 3 / out of scope.
