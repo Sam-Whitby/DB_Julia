@@ -719,6 +719,15 @@ end
 # Condition implied by Min[a,b] (TRUE iff a < b), as (eff_lhs, strict).
 # Requires the cleared-denominator difference a-b to be a balanced binomial
 # c*(exp(-bL1) - exp(-bL2)); then a<b reduces to the linear form (L1-L2)>0.
+#
+# SOUNDNESS ASSUMPTION: clearing the operands' (1-exp) denominators preserves
+# the inequality direction only where those denominators are POSITIVE. This
+# holds wherever the Min is actually evaluated, because (as in VMMC) the Min
+# sits under a guard that forces denominator positivity (e.g. eInit<eFwd makes
+# 1-exp(-b*(eFwd-eInit)) > 0). The registered hyperplane is correct in that
+# region; in chambers where the guard fails the Min is never reached, so the
+# condition's value there is irrelevant. A Min used WITHOUT such a guard would
+# need explicit denominator-sign tracking (not implemented) -- see AUDIT.md.
 function min_condition(a::ThExpr, b::ThExpr, aidx, nA)
     va = eval_static(a, aidx, nA); vb = eval_static(b, aidx, nA)
     numer = bs_sub(bs_mul(va.num, expand_binoms(vb.den, nA)),
