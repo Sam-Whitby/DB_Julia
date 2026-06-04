@@ -349,5 +349,9 @@ whenever it meets something it cannot represent exactly:
 | `check.jl` | command-line driver (`[-maxdepth N] [-parallel]`) |
 | `test_db.jl` | unit + fail-loud + end-to-end example suite |
 | `TEMPLATE.jl` | annotated template for writing your own algorithm |
-| `examples/` | twelve worked translations (nine standard + three edge cases) |
+| `examples/` | fifteen worked translations (standard algorithms + edge cases) |
 | `AUDIT.md` | critical soundness/performance audit and how each issue is addressed |
+| `doc/expressiveness.md` | the exact class of weight/energy/condition functions handled |
+| `ideas.md` | analysis of inductive generalisation across system sizes, and D4 |
+| `type-taint.md` + `doc/typetaint_poc.jl` | investigation of a species-equivariance certificate for the BFS (with PoC) |
+| `doc/dbc_method.{tex,pdf}` | a 2-page method writeup |
