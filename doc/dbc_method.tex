@@ -1,0 +1,177 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=2.05cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage[hidelinks]{hyperref}
+\usepackage{enumitem}
+\setlist{noitemsep,topsep=2pt,leftmargin=1.4em}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{6pt}{2pt}
+\titlespacing*{\paragraph}{0pt}{4pt}{6pt}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Q}{\mathbb{Q}}
+
+\title{\vspace{-1.2cm}\textbf{DB\_Julia: Exact Symbolic Verification of\\ Detailed Balance for Lattice Monte~Carlo}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.6cm}
+
+\begin{abstract}
+\noindent
+DB\_Julia decides, exactly and without sampling, whether a lattice Monte-Carlo
+update satisfies detailed balance with respect to a Boltzmann distribution, and
+does so \emph{simultaneously for all values of the model's coupling parameters}.
+It intercepts every random draw the algorithm makes, reconstructs the exact
+symbolic transition probabilities by exhaustively enumerating the algorithm's
+decision tree, and verifies the detailed-balance identity as an exact polynomial
+identity over each region of coupling space. Every step uses exact rational
+arithmetic; anything that cannot be represented exactly is raised as a hard error
+rather than approximated, so the tool cannot return a false verdict.
+\end{abstract}
+
+\section{Problem}
+A Markov chain on a finite state space with transition probabilities $T(s\to t)$
+samples the target $\pi$ if it satisfies \emph{detailed balance},
+\begin{equation}\label{eq:db}
+T(s\to t)\,\pi(s) \;=\; T(t\to s)\,\pi(t)\qquad\text{for all states } s,t .
+\end{equation}
+We take $\pi(s)\propto e^{-\beta E(s)}$ with a pairwise lattice energy
+\begin{equation}\label{eq:energy}
+E(s)=\sum_{i<j} J_{\,t_i t_j}^{\,d^2(i,j)}\;\equiv\;\langle c(s),J\rangle ,
+\end{equation}
+i.e.\ $E$ is \emph{linear} in a finite vector of coupling parameters
+$J=(J_a)_{a\in\mathcal{A}}$ (one ``atom'' $a$ per species pair and squared
+interaction distance; an optional field parameter is allowed). The integer vector
+$c(s)$ counts how many interacting pairs of each type occur in $s$. A state is a
+placement of typed particles on an $n\times n$ torus. The verifier confirms
+\eqref{eq:db} for \emph{every} pair $(s,t)$ and \emph{every} $J\in\R^{|\mathcal{A}|}$.
+
+\paragraph{Input.} The user supplies one MCMC step as a short Julia function
+\code{algorithm(rng,state)} together with \code{energy(state)}. All randomness goes
+through provided primitives (uniform choice, uniform integer, Metropolis
+acceptance, and a small algebra of symbolic acceptance thresholds for cluster
+moves). Geometry is queried only through translation-aware helpers.
+
+\section{Method}
+The pipeline has five exact stages.
+
+\paragraph{1. State enumeration.}
+All distinct placements of the species multiset on the torus are generated and
+cross-checked against the closed-form count $P(S,N)/\prod_k m_k!$, where $S=n^2$,
+$N$ is the particle number and $m_k$ the multiplicities. A mismatch is a hard
+error.
+
+\paragraph{2. $\tau$-augmented decision-tree enumeration.}
+Each coordinate is carried as a \emph{$\tau$-number}
+$v+c_r\tau_r+c_c\tau_c$ (plus a flag marking any genuinely nonlinear $\tau$ term),
+where $\tau_r,\tau_c$ are formal lattice-translation offsets and $v\in\Q$ is the
+true value (the algorithm runs at $\tau=0$). Differences of positions cancel
+$\tau$, so distances and occupancy tests are $\tau$-free; squaring a coordinate
+produces a $\tau^2$ term. A quantity is \emph{translation invariant} iff its
+$\tau$-coefficients vanish and it is untainted.
+
+For a fixed seed state the algorithm is replayed against \emph{every} finite bit
+string by a deterministic \code{BitSeqRNG}. A $k$-way uniform choice consumes
+$\lceil\log_2 k\rceil$ bits and multiplies an exact rational path probability
+(out-of-range patterns are rejected, reproducing exact rejection sampling); each
+acceptance test reads one bit and records a \emph{symbolic} threshold rather than
+a number. Branching over both bit values enumerates the complete decision tree.
+Its leaves are the pairs $(t,\,w_{s\to t})$, and the weights sum to~$1$ by
+construction. Summing leaves with the same successor gives $T(s\to t)$ exactly.
+
+Two structural facts are read off this tree. (i)~If any recorded threshold,
+branch condition, or output coordinate carries a nonzero $\tau$-coefficient, the
+update is \emph{not} translation invariant and this is reported. (ii)~Every
+output position is checked to be translation \emph{covariant} (it shifts with the
+lattice); this licenses the orbit-reduction optimisation below and, when it
+fails, forces the safe all-states path.
+
+\paragraph{3. Exact symbolic weights.}
+A leaf weight is a rational coefficient times a product of acceptance factors.
+A Metropolis factor is the piecewise threshold
+$\min\!\big(1,e^{-\beta\,\langle \Delta,J\rangle}\big)$; cluster moves (VMMC) need
+ratios of $(1-e^{-\beta L})$ terms capped by a $\min$. All such values are
+represented as exact \emph{rational functions of exponential monomials},
+\begin{equation}\label{eq:val}
+\mathrm{Val}=\frac{\textstyle\sum_{v} q_v\,e^{-\beta\langle v,J\rangle}}
+                  {\textstyle\prod_{k}\big(1-e^{-\beta\langle L_k,J\rangle}\big)},
+\qquad q_v\in\Q,
+\end{equation}
+with numerator a Laurent polynomial in the monomials and denominator a multiset of
+binomials. This class is closed under $+,-,\times$ and under division by a single
+binomial---exactly what the supported updates require. Anything outside it is a
+hard error.
+
+\paragraph{4. Chambers of coupling space.}
+Every branch condition is a linear inequality $\langle h,J\rangle\lessgtr 0$; the
+finite set of such hyperplanes partitions $\R^{|\mathcal{A}|}$ into open
+\emph{chambers}, inside each of which every piecewise threshold takes a single
+branch and so resolves to a fixed $\mathrm{Val}$. The chambers are enumerated by a
+breadth-first search over the hyperplane arrangement (adjacent chambers differ in
+one sign), where feasibility of each candidate sign pattern is decided by an
+\emph{exact rational simplex}. Because the chamber-adjacency graph is connected,
+this search is complete given an exact feasibility oracle.
+
+\paragraph{5. Detailed-balance residual.}
+Using \eqref{eq:energy}, $\pi(s)\propto e^{-\beta\langle c(s),J\rangle}$, so within
+a chamber the signed residual of \eqref{eq:db},
+\begin{equation}\label{eq:res}
+R_{st}(J)=\sum_{\text{leaves }s\to t} w\,e^{-\beta\langle c(s),J\rangle}
+         -\sum_{\text{leaves }t\to s} w\,e^{-\beta\langle c(t),J\rangle},
+\end{equation}
+is a rational function of exponential monomials. Multiplying through by the common
+$(1-e^{-\beta L})$ denominator---nonzero on the open chamber---turns $R_{st}$ into a
+single Laurent polynomial; detailed balance holds throughout the chamber iff
+\emph{every} coefficient is zero. Coefficients are grouped by their exact rational
+exponent vector (handling half-integer exponents directly) and tested for
+vanishing in $\Q$. The algorithm passes iff $R_{st}\equiv0$ for all communicating
+pairs and all chambers. Ergodicity is reported separately as reachability in the
+transition graph.
+
+\section{Soundness, determinism and performance}
+\paragraph{Exactness.} All arithmetic is exact rational
+(\code{Rational\{Int128\}}). Julia's rational arithmetic is overflow-checked, so an
+out-of-range computation throws and aborts rather than wrapping silently; the
+driver reports this as a hard error. The chamber test is an exact simplex with no
+tolerance, so no floating point enters the verdict.
+\paragraph{Open-chamber completeness.} Detailed balance is verified on the open
+chambers only. Since $T$ and $\pi$ are continuous in $J$, any violation on a
+positive-measure set already appears in an adjacent open chamber; measure-zero
+boundaries need not be tested separately.
+\paragraph{Fail-loud.} A path exceeding the depth bound, a non-integer or
+non-covariant coordinate, an empty or inverted random range, a $\min$ whose switch
+is not a genuine hyperplane, a division by a non-binomial, or a comparison that
+would leak an absolute position---each is a hard error, never a guess.
+\paragraph{Determinism.} There is no RNG anywhere; the bit-tree BFS, canonical
+orderings, and exact simplex are deterministic, and the optional multi-threaded
+mode is tested to reproduce the serial verdict, chamber count and transition graph
+bit-for-bit.
+\paragraph{Performance.} Three optimisations keep the cost down without affecting
+the result: translation-orbit reduction (BFS one representative per orbit and
+translate its leaves, valid because of the covariance check); per-pair projection
+onto each pair's few active conditions; and hash-consing of thresholds so the
+model is built from unique weights. The verifier is exhaustive by construction and
+is intended for small representative systems; cost grows with the number of states
+and chambers.
+
+\begin{center}\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Stage & Output & Exactness mechanism\\
+\midrule
+State enumeration & all states & combinatorial cross-check\\
+$\tau$-BFS & leaves $(t,w)$, $\tau$/covariance verdict & rational weights, formal $\tau$\\
+Weight algebra & $\mathrm{Val}=\text{num}/\prod(1-e^{-\beta L})$ & closed rational-function class\\
+Chambers & open regions of $J$-space & exact rational simplex\\
+DB residual & per-pair, per-chamber & vanishing of $\Q$-coefficients\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
