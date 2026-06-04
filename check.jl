@@ -93,11 +93,14 @@ function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
     println("  Ergodicity : ", erg.ergodic ? "PASS" : "FAIL")
 
     println(SEP2); println("  Step 4: Detailed balance (exact-LP chambers + exact rational check)"); println(SEP2)
-    local pass, viol, nch
+    local pass, viol, nch, m
     try
         tm = @elapsed m = build_dbmodel(bfs, energy)
         td = @elapsed ((pass, viol, nch) = run_db_check(m; parallel=parallel))
         @printf("  Chambers : %d   (model %.2fs, check %.2fs)\n", nch, tm, td)
+        @printf("  DB pairs : %d of %d checked  (graph symmetry: %s)\n",
+                length(m.check_pairs), length(m.pairs),
+                isempty(m.sym_names) ? "none verified" : join(m.sym_names, ", "))
     catch e
         e isa CantHandle ? (println("  ERROR: ", e.msg); exit(1)) :
         e isa OverflowError ? (println("  ERROR: exact-arithmetic overflow (Int128) during DB check — ",

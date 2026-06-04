@@ -285,3 +285,27 @@ error, never a guess.
 - **Int128 overflow** is fail-loud, not auto-promoting; a system large enough to
   overflow aborts cleanly rather than silently widening to BigInt. Re-running such
   a case would need a BigInt build (a one-line change to `Q`).
+
+### 5.9 Graph-verified p4m symmetry reduction of the DB check (NEW optimisation)
+
+Following `ideas.md` §2.3, the detailed-balance check now exploits the lattice's
+full symmetry group (translations ⋊ D4) to evaluate the residual on only one pair
+per symmetry orbit. The win over the previous design (which already did per-pair
+condition projection) is real but bounded: it cuts the VMMC DB check from ≈2.1 s to
+≈0.9 s (pairs checked 11088 → 174) and never makes any case slower.
+
+The soundness discipline is the whole point: a symmetry `g` is used **only after
+being verified on the COMPUTED transition graph** — `E(g·s)=E(s)` exactly, and every
+edge `(s→t)` maps to an edge `(g·s→g·t)` with the identical weight-index multiset
+(which, given hash-consing over D4-invariant atoms, is a sufficient exact test for
+identical symbolic weights). The algorithm is never trusted; a symmetry that fails
+to verify is dropped (more pairs checked, never fewer than correctness needs). This
+is exactly why the long-standing "D4 is too slow or needs trust" dilemma is avoided:
+the dilemma applies to using D4 to skip the *BFS*, whereas here D4 only prunes
+*provably redundant DB-pair evaluations*. The reduction also captures partial
+symmetry (column-only translations for a row field; translations-only for a
+directional bias). The regression suite asserts, for every example, that the
+symmetry-reduced verdict and chamber count equal the all-pairs baseline, and encodes
+the D4⟂DB independence facts (an anisotropic defect breaks both; an isotropic defect
+breaks DB while keeping full symmetry; a failed symmetry check is never read as a DB
+conclusion).

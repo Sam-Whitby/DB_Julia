@@ -97,7 +97,10 @@ the next state with plain arithmetic — the harness wraps it onto the torus for
 
 Translational invariance is **always reported**; it does not by itself fail the
 run (an absolute-field algorithm like `quadratic_field` is correctly τ-FAIL yet
-DB-PASS). Point-group (D4) symmetry is never used.
+DB-PASS). Full lattice symmetry (translations **and** the square point group D4)
+is exploited to speed the detailed-balance check, but only after being **verified
+on the computed transition graph** — the algorithm itself is never trusted (see
+"How it works" §6).
 
 ---
 
@@ -161,6 +164,38 @@ to a single Laurent polynomial; DB holds in that chamber iff **every coefficient
 is zero** — checked exactly with `Rational{Int128}`. Grouping by exponent vector
 handles half-integer exponents (e.g. `exp(-β·dE/2)`) directly.
 
+### 6. Symmetry-reduced DB check — verified on the graph, never assumed
+The square lattice's full symmetry group is `p4m` = translations ⋊ D4 (rotations
+and reflections). If a lattice symmetry `g` is a symmetry of the *system*, then
+`T(g·s → g·t) = T(s→t)` and `π(g·s) = π(s)`, so the detailed-balance residual of
+`(g·s, g·t)` is **identical** to that of `(s,t)` — and DB need be checked on only
+one pair per symmetry orbit (up to ~`8·n²` fewer pairs).
+
+Crucially, the checker does **not** assume the algorithm has this symmetry; it
+**verifies it on the already-computed transition graph**, which is sound and cheap:
+
+- **energy invariance** `E(g·s) = E(s)` (exact integer-vector comparison), and
+- **graph equivariance** — every edge `(s→t)` has an edge `(g·s→g·t)` carrying the
+  *identical multiset of weight indices*. Because weights are built from
+  D4-invariant coupling atoms and hash-consed, equal indices imply *identical*
+  symbolic weights (a sufficient, exact test).
+
+Both checks are `O(#states + #edges)` for the generators of `p4m`. A symmetry that
+does not verify is simply dropped (more pairs are checked, never fewer than
+correctness needs), so this is **speed-only and can never change the verdict** —
+proven in the test suite, which checks every example's reduced verdict against the
+full all-pairs baseline. The reduction picks up *partial* symmetry too: a
+row-dependent field (`quadratic_field`, `broken_field_wrong_accept`) verifies only
+column translations, and a directional bias (`broken_biased_direction`) verifies
+only translations (its anisotropy correctly fails D4) — yet the DB violation is
+still caught in both.
+
+> **D4 and detailed balance are independent.** A D4-asymmetric algorithm can still
+> satisfy DB (e.g. horizontal-only Metropolis), and a perfectly D4-symmetric one
+> can violate it (e.g. `broken_metropolis_halfbeta`, `broken_variable_pool`). So a
+> failed symmetry check is **never** used to conclude anything about DB — it only
+> means more pairs are evaluated. The DB verdict is always computed in full.
+
 ### Why it is fast
 - Exact arithmetic in **`Rational{Int128}`** rather than `BigInt`: the BFS no
   longer allocates a GMP bignum per tiny-integer operation (~3× faster), while
@@ -169,9 +204,13 @@ handles half-integer exponents (e.g. `exp(-β·dE/2)`) directly.
   projection of the chambers onto its few active conditions, not once per chamber.
 - **Lazy, cached weight evaluation** and **hash-consed thresholds** so the model
   is built from unique weights, deduplicated by object identity.
-- **Translation-orbit reduction:** one representative per orbit is BFS'd and its
-  leaves are translated to the rest — sound because the covariance check
-  guarantees equivariance (falls back to all-states otherwise).
+- **Translation-orbit reduction (BFS):** one representative per translation orbit
+  is BFS'd and its leaves are translated to the rest — sound because the covariance
+  check guarantees equivariance (falls back to all-states otherwise).
+- **Graph-verified `p4m` symmetry reduction (DB check):** detailed balance is
+  evaluated on one pair per symmetry orbit, using only symmetries verified on the
+  computed graph (§6). For VMMC this cuts the pairs checked from 11088 to 174 and
+  the DB-check time from ≈2.1 s to ≈0.9 s.
 - **`-parallel`** (with `julia -t auto`) spreads the per-representative BFS and the
   per-pair DB check across cores; the exact LP and the verdict are unchanged.
 
@@ -180,33 +219,48 @@ handles half-integer exponents (e.g. `exp(-β·dE/2)`) directly.
 ## Examples & timings
 
 All examples live in `examples/`. Verdicts and chamber counts below are the exact
-results; wall-clock is a single `check.jl` invocation on an Apple-silicon laptop
-and **includes ~6–8 s of Julia JIT warm-up per process** (a `PackageCompiler.jl`
-system image removes it — see below).
+results. The **DB pairs** column shows how many pairs the graph-verified `p4m`
+symmetry reduction actually checks versus the total (`sym` = which symmetries
+verified: T = translations, D4 = full point group, T_c = column translations only).
 
-| Example | Trans. | Detailed balance | Ergodicity | states | chambers |
-|---|---|---|---|---|---|
-| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 |
-| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 |
-| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 |
-| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 |
-| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 |
-| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 |
-| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 |
-| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 |
-| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 |
-| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 |
-| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 |
-| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 |
+| Example | Trans. | Detailed balance | Ergodicity | states | chambers | DB pairs | sym |
+|---|---|---|---|---|---|---|---|
+| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 | 72 / 4536 | T·D4 |
+| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 | 18 / 756 | T·D4 |
+| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 | 8 / 16 | T_c |
+| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 | 6 / 252 | T·D4 |
+| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 | 20 / 1792 | T·D4 |
+| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 | 504 / 4536 | T |
+| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 | 72 / 4536 | T·D4 |
+| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 | 8 / 16 | T_c |
+| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 | 174 / 11088 | T·D4 |
+| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 | 20 / 1792 | T·D4 |
+| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 20 / 1792 | T·D4 |
+| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 14 / 42 | T_c |
 
-The last three are added edge cases: a **correct** power-of-two pool on a larger
-4×4 lattice (`hop_8way_correct`); a larger interacting 4×4 system
-(`metropolis_4x4`); and a **non-translation-covariant** move (`reflect_move`) that
-exercises the covariance guard — without that guard, orbit reduction would report
-a *wrong* verdict on it (see AUDIT.md §New).
+Three are deliberate edge cases: a **correct** power-of-two pool on a larger 4×4
+lattice (`hop_8way_correct`); a larger interacting 4×4 system (`metropolis_4x4`);
+and a **non-translation-covariant** move (`reflect_move`) that exercises the
+covariance guard — without that guard, orbit reduction would report a *wrong*
+verdict on it (see AUDIT.md §5.3). Note how `broken_biased_direction` verifies
+only translations (its directional bias breaks D4) and the row-field cases verify
+only column translations — the reduction discovers exactly the symmetry the
+*graph* actually has.
 
-Warm (JIT excluded) compute, serial: VMMC ≈ 5 s total (BFS ≈ 3 s, DB ≈ 2 s);
-single-Metropolis ≈ 5 s. With `-parallel` on 8 threads the VMMC BFS drops to ~1 s.
+**Warm compute (JIT excluded), serial** on an Apple-silicon laptop:
+
+| Example | BFS | model | DB check | total |
+|---|---|---|---|---|
+| `single_metropolis.jl` | 0.19 s | 0.01 s | 1.27 s | ≈ 1.5 s |
+| `metropolis_4x4.jl` | 0.04 s | 0.01 s | 0.27 s | ≈ 0.3 s |
+| `vmmc_2d.jl` | 3.2 s | 0.05 s | 0.97 s | ≈ 4.2 s |
+
+The graph-verified symmetry reduction makes the VMMC DB check ≈2.1× faster (0.97 s
+vs 2.08 s checking all pairs). With `-parallel` on 8 threads the VMMC BFS drops to
+≈1 s. A single cold `check.jl` invocation additionally pays **~13–18 s of Julia JIT
+compilation** (the engine is recompiled per process); the regression suite
+amortises this across all examples, and a `PackageCompiler.jl` system image removes
+it entirely (below).
 
 ### Removing the JIT warm-up (optional)
 Most of the wall-clock for the small cases is Julia compiling the engine afresh

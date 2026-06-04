@@ -274,6 +274,11 @@ the symbolic BFS of the reps and the per-pair DB residual, not the state count.
 
 ### 2.3 The one honest win: D4 on the DB-check phase, verified on the *graph*
 
+> **Status: implemented.** This is now the production DB-check path (`dbc.jl`,
+> `_verified_graph_symmetry_reps`; AUDIT §5.9). For VMMC it cuts the pairs checked
+> from 11088 to 174 and the DB-check time ≈2.1 s → ≈0.9 s, and the suite proves the
+> reduced verdict equals the all-pairs baseline on every example.
+
 There is a place where D4 *can* help **soundly and without trusting the
 algorithm**: the **detailed-balance check phase**, by exploiting symmetry of the
 **already-computed transition graph** rather than of the code.

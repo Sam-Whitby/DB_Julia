@@ -192,9 +192,13 @@ function _run_pipeline(n, types, algo, energy)
     states = enumerate_states(types, n)
     bfs = build_transitions(algo, energy, states, n, 30)
     erg = check_ergodicity(bfs, seed_state(types, n))
-    pass, _, _ = run_db_check(build_dbmodel(bfs, energy))
+    m = build_dbmodel(bfs, energy)
+    pass_r, _, ch_r = run_db_check(m; use_symmetry=true)            # graph-symmetry reduced
+    pass_f, _, ch_f = run_db_check(m; use_symmetry=false)           # every pair (baseline)
     cnt = length(states) == theoretical_count(types, n)
-    (tau=bfs.tau_free, db=pass, erg=erg.ergodic, count=cnt)
+    (tau=bfs.tau_free, db=pass_r, erg=erg.ergodic, count=cnt,
+     db_full=pass_f, ch_eq=(ch_r == ch_f), sym=m.sym_names,
+     npairs=length(m.pairs), nreps=length(m.check_pairs))
 end
 function run_example(path)
     Base.include(Main, path)                         # (re)defines NGRID/energy/algorithm
@@ -212,6 +216,32 @@ end
     @test r.tau == etau
     @test r.db  == edb
     @test r.erg == eerg
+    # SOUNDNESS OF THE SYMMETRY REDUCTION: the graph-symmetry-reduced DB verdict
+    # MUST equal the all-pairs baseline (no false PASS, no false FAIL), with the
+    # same chamber count, and it must actually reduce when a symmetry holds.
+    @test r.db == r.db_full
+    @test r.ch_eq
+    @test r.nreps <= r.npairs
+end
+
+# D4 vs detailed balance are logically INDEPENDENT (the reduction is speed-only):
+#  - an anisotropic defect breaks BOTH point-group symmetry AND DB;
+#  - an isotropic defect breaks DB but keeps full p4m symmetry;
+#  - a symmetric correct move has full symmetry and satisfies DB.
+@testset "D4 ⟂ DB independence (reduction is speed-only, never a verdict)" begin
+    bias = run_example(joinpath(@__DIR__, "examples", "broken_biased_direction.jl"))
+    @test bias.db == false                                   # DB violated
+    @test !("rotate90" in bias.sym) && !("reflect" in bias.sym)  # anisotropy breaks D4 too
+    @test bias.db == bias.db_full                            # still caught with translations only
+
+    pool = run_example(joinpath(@__DIR__, "examples", "broken_variable_pool.jl"))
+    @test pool.db == false                                   # DB violated
+    @test ("rotate90" in pool.sym) && ("reflect" in pool.sym)    # isotropic: D4 holds anyway
+    @test pool.db == pool.db_full                            # D4-PASS does NOT hide the DB failure
+
+    good = run_example(joinpath(@__DIR__, "examples", "single_metropolis.jl"))
+    @test good.db && ("rotate90" in good.sym) && ("reflect" in good.sym)
+    @test good.nreps < good.npairs                           # full p4m actually reduces work
 end
 
 end
