@@ -51,6 +51,14 @@ anywhere with no thread-startup cost):
 julia --project=. -t auto check.jl examples/vmmc_2d.jl -parallel
 ```
 
+Check **global balance** (`π·T = π`) instead of the stronger detailed balance — this
+accepts correct **non-reversible** samplers that DB rejects (see below):
+
+```
+julia --project=. check.jl examples/directed_sweep.jl            # Detailed balance: FAIL
+julia --project=. check.jl examples/directed_sweep.jl -balance   # Balance: PASS
+```
+
 Run the regression + stress suite (unit pieces, fail-loud paths, and all bundled
 examples with their known PASS/FAIL verdicts):
 
@@ -262,6 +270,28 @@ The test suite checks every example's reduced verdict against the all-pairs base
 > **never** used to conclude anything about DB — it only means more pairs are
 > evaluated. The DB verdict is always computed in full.
 
+### 7. Global balance (`-balance`) — the weaker, *necessary* condition (exact)
+Correct sampling requires only **stationarity** `π·T = π` (global balance); detailed
+balance is a stronger, *sufficient* condition. An entire family of modern samplers —
+event-chain, lifting, Suwa–Todo — deliberately **violates DB** to mix faster, yet
+samples `π` correctly. Passing `-balance` checks balance instead of DB, so those are
+accepted.
+
+Balance is the **column sum** of the DB residual matrix: for each target state `t`,
+```
+B_t  =  Σ_s [ T(s→t)·π(s) − T(t→s)·π(t) ]  =  0 .
+```
+The `s = t` term cancels, so only off-diagonal transitions enter (exactly what the
+graph stores). The check reuses the **same exact rational machinery** as DB — it sums
+the directed leaf contributions over a *common* `(1−exp)` denominator and tests that
+the numerator's coefficients all vanish in `ℚ` — so it is **exact and float-free**,
+just like the DB check. It is symmetry-reduced the same way (one target per verified
+state-orbit, since `B_{g·t} ≡ 0 ⇔ B_t ≡ 0`). `examples/directed_sweep.jl` is the
+canonical demonstration: a directed shift is **DB-FAIL** but **balance-PASS** (a cyclic
+permutation of states keeps the uniform `π` stationary). DB still implies balance, so
+every DB-PASS example also passes `-balance`. Default behaviour is unchanged (detailed
+balance); `-balance` is opt-in.
+
 ### Why it is fast
 - Exact arithmetic in **`Rational{Int128}`** rather than `BigInt`: the BFS no
   longer allocates a GMP bignum per tiny-integer operation (~3× faster), while
@@ -325,6 +355,7 @@ so its BFS is reduced over the point group too.
 | `hop_repeated_species.jl` | PASS | PASS | PASS | 756 | 42 | … | p4m × **S₂ (1↔2)** |
 | `broken_species_halfbeta.jl` | PASS | **FAIL** (species-dep. `β/2`) | PASS | 504 | 56 | … | T·D4 (species declined) |
 | `swap_literal_species.jl` | PASS | PASS | FAIL (N! perms) | 504 | 56 | … | T·D4 (species declined) |
+| `directed_sweep.jl` | PASS | **FAIL** (non-reversible) | FAIL (directed) | 9 | 1 | — | T, reflect_h (**balance PASS** with `-balance`) |
 
 `vmmc_2d_shuffle` is the headline: with the `MOVES` contract its BFS drops 56→**4**
 reps (warm BFS ≈2.5 s → ≈0.8 s) — species *and* full-D4 reduction. `vmmc_2d` declines
@@ -461,10 +492,10 @@ whenever it meets something it cannot represent exactly:
 | File | Purpose |
 |---|---|
 | `dbc.jl` | the engine (TauNum, BitSeqRNG, exact rational/Val algebra, exact simplex, BFS, DB check) |
-| `check.jl` | command-line driver (`[-maxdepth N] [-parallel]`) |
+| `check.jl` | command-line driver (`[-maxdepth N] [-parallel] [-balance]`) |
 | `test_db.jl` | unit + fail-loud + end-to-end example suite |
 | `TEMPLATE.jl` | annotated template for writing your own algorithm |
-| `examples/` | twenty worked translations (standard algorithms + symmetry / weight-class / particle-swap / order-independence edge cases) |
+| `examples/` | twenty-one worked translations (standard algorithms + symmetry / weight-class / particle-swap / order-independence / non-reversible edge cases) |
 | `AUDIT.md` | critical soundness/performance audit and how each issue is addressed |
 | `doc/expressiveness.md` | the exact class of weight/energy/condition functions handled |
 | `ideas.md` | analysis of inductive generalisation across system sizes, and D4 |

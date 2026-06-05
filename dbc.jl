@@ -1072,49 +1072,43 @@ function _unwrap_cant(e)
     e
 end
 
-# ---- OIP cross-check: verify order-independence of the TRANSITION distribution --
-# A leaf weight is order-independent as a PRODUCT, but an algorithm with an
-# early-abort (e.g. VMMC's frustration → reject) decomposes the rejection
-# probability into DIFFERENT partial-product leaves per order, whose individual
-# weights differ while their SUM (the true T(s→t)) does not. So we compare the
-# per-successor SUMMED transition probability, not the raw leaf multiset.
+# ---- OIP cross-check: verify order-independence EXACTLY (no floats) -------------
+# A canonical, deterministic key for a threshold (reusing the canonical RatForm /
+# condition keys), so structurally-equal thresholds get equal keys regardless of how
+# they were built — the comparison is independent of the interning cache state.
+function _th_key(t::ThExpr)
+    t isa ThConst  ? (:const, t.c) :
+    t isa ThBoltz  ? (:boltz, _form_key(t.L)) :
+    t isa ThLinear ? (:lin,   _form_key(t.L)) :
+    t isa ThOp     ? (:op, t.op, _th_key(t.a), _th_key(t.b)) :
+    t isa ThMin    ? (:min, _th_key(t.a), _th_key(t.b)) :
+    t isa ThMax    ? (:max, _th_key(t.a), _th_key(t.b)) :
+    t isa ThPiece  ? (:piece, Tuple((Tuple(cond_key(c) for c in gs), _th_key(v)) for (gs, v) in t.clauses), _th_key(t.default)) :
+    error("unknown ThExpr in _th_key")
+end
+# A leaf's order-invariant signature: successor, rational coefficient, and the
+# MULTISET of acceptance factors (a leaf weight is a PRODUCT, so factor order is
+# irrelevant). Factors are canonicalised to strings so a heterogeneous multiset
+# sorts without ambiguity.
+_leafsig(lf::Leaf) = (lf.next, lf.coeff,
+    sort(String[string(_th_key(f.thr)) * (f.accepted ? "+" : "-") for f in lf.factors]))
+# Do two leaf sets of the SAME seed agree on their OFF-DIAGONAL transitions?
 #
-# The comparison is by float evaluation at several DETERMINISTIC coupling points
-# and betas — the identical random-coupling-point methodology the test suite uses to
-# validate the species / point-group graph reductions (`_species_graph_consistency`,
-# `_pg_graph_consistency`), here as a per-run guard. It is deterministic (the points
-# are a fixed function of the atom index, no RNG), and it only gates a SPEED feature:
-# the suite additionally pins each shipped `unordered` example to an exact direct
-# all-states build. A mismatch is a hard error (the body is order-dependent).
-function _oip_points(atoms::Vector{Atom})
-    pts = Dict{Atom,Float64}[]
-    for m in 1:6
-        J = Dict{Atom,Float64}()
-        for (k, a) in enumerate(atoms); J[a] = cos(1.0k + 2.3m) * (0.5 + 0.4 * sin(0.7k - 1.1m)); end
-        push!(pts, J)
-    end
-    pts
-end
-function _oip_tvec(leaves::Vector{Leaf}, J::Dict{Atom,Float64}, beta::Float64)
-    T = Dict{CState,Float64}()
-    for lf in leaves; T[lf.next] = get(T, lf.next, 0.0) + eval_leaf(lf, J, beta); end
-    T
-end
-function _oip_match(la::Vector{Leaf}, lb::Vector{Leaf})::Bool
-    seen = Set{Atom}(); atoms = Atom[]
-    for lf in Iterators.flatten((la, lb)), f in lf.factors
-        s2 = Set{Atom}(); _collect_atoms_th!(s2, f.thr)
-        for a in s2; (a in seen) || (push!(seen, a); push!(atoms, a)); end
-    end
-    sort!(atoms)
-    for J in _oip_points(atoms), beta in (0.6, 1.0, 1.5)
-        Ta = _oip_tvec(la, J, beta); Tb = _oip_tvec(lb, J, beta)
-        for k in union(keys(Ta), keys(Tb))
-            a = get(Ta, k, 0.0); b = get(Tb, k, 0.0)
-            abs(a - b) <= 1e-7 * (1 + abs(a)) || return false
-        end
-    end
-    true
+# The diagonal (self-loop, next == seed) carries an algorithm's rejection
+# probability, which an early-abort move (e.g. VMMC's frustration) decomposes into
+# DIFFERENT partial-product leaves per visiting order. But the diagonal enters
+# NEITHER detailed balance NOR global balance (both cancel the s==t term; the stored
+# transition graph already drops self-loops), and the OFF-diagonal transition leaves
+# are order-invariant EXACTLY (any order links the same candidates with the same
+# commutative product). So comparing the off-diagonal leaf multiset is an exact,
+# float-free order-independence test that is sufficient for either verdict — and
+# tight: an order-DEPENDENT successor probability changes the off-diagonal multiset.
+function _oip_match(la::Vector{Leaf}, lb::Vector{Leaf}, seed::CState)::Bool
+    da = Dict{Any,Int}()
+    for lf in la; lf.next == seed && continue; k = _leafsig(lf); da[k] = get(da, k, 0) + 1; end
+    db = Dict{Any,Int}()
+    for lf in lb; lf.next == seed && continue; k = _leafsig(lf); db[k] = get(db, k, 0) + 1; end
+    da == db
 end
 
 # BFS `seeds` in canonical order; if the algorithm used `unordered`, ALSO BFS in a
@@ -1141,11 +1135,11 @@ function _bfs_seeds_oip(algo, seeds::Vector{CState}, n::Int, maxdepth::Int, para
         _OIP_ORDER[] = 2
         alt = _bfs_seeds(algo, seeds, n, maxdepth, parallel; seedfn = augmented_pstate)
         for i in eachindex(seeds)
-            _oip_match(base[i], alt[i]) || begin
+            _oip_match(base[i], alt[i], seeds[i]) || begin
                 _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
                 cant("unordered(): the result depends on the candidate visitation order " *
-                     "(transition probabilities differ between two orders) — `unordered` requires " *
-                     "the loop body's effect to be independent of order")
+                     "(off-diagonal transition probabilities differ between two orders) — " *
+                     "`unordered` requires the loop body's effect to be independent of order")
             end
         end
         _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
@@ -1438,6 +1432,7 @@ struct DBModel
     ji_srcs        :: Vector{Vector{Int}}
     check_pairs    :: Vector{Int}              # pair indices actually checked (symmetry reps)
     sym_names      :: Vector{String}           # graph-verified symmetry generators used
+    check_targets  :: Vector{Int}              # target STATES checked in -balance mode (one per orbit)
 end
 
 # ---- species-permutation (type) symmetry support ----------------------------
@@ -1613,7 +1608,7 @@ function _verified_graph_symmetry_reps(bfs::BFSResult,
             if kk != 0; ra = findset(k); rb = findset(kk); ra != rb && (parent[ra] = rb); end
         end
     end
-    (Int[k for k in 1:P if findset(k) == k], names)
+    (Int[k for k in 1:P if findset(k) == k], names, verified)
 end
 
 function build_dbmodel(bfs::BFSResult, energy)::DBModel
@@ -1679,11 +1674,21 @@ function build_dbmodel(bfs::BFSResult, energy)::DBModel
 
     # Symmetry reduction of the pair set, verified on the computed graph (sound;
     # speed only). Falls back to all pairs when no symmetry verifies.
-    check_pairs, sym_names = _verified_graph_symmetry_reps(bfs, energy_coeffs, pairs,
+    check_pairs, sym_names, state_perms = _verified_graph_symmetry_reps(bfs, energy_coeffs, pairs,
                                                            uweights, atoms, aidx)
 
+    # State-orbit reps under the SAME verified group (for the -balance column check:
+    # the balance residual B_{g·t} is identically zero iff B_t is, so one target per
+    # orbit suffices — the column analogue of the pair-orbit reduction).
+    nS = length(bfs.states); parentS = collect(1:nS)
+    findS(x) = (while parentS[x] != x; parentS[x] = parentS[parentS[x]]; x = parentS[x]; end; x)
+    for π in state_perms, s in 1:nS
+        a = findS(s); b = findS(π[s]); a != b && (parentS[a] = b)
+    end
+    check_targets = Int[s for s in 1:nS if findS(s) == s]
+
     DBModel(aidx, nA, eff_list, strict_list, energy_coeffs, ctx,
-            uweights, uw_active, pairs, ij_srcs, ji_srcs, check_pairs, sym_names)
+            uweights, uw_active, pairs, ij_srcs, ji_srcs, check_pairs, sym_names, check_targets)
 end
 
 # ---- Phase 2: chamber enumeration via EXACT rational LP + degenerate filter ----
@@ -1844,7 +1849,8 @@ end
 # The pair loop is independent per pair, so it is the natural parallel unit; each
 # thread keeps its own Val cache (correctness is unaffected — the cache only
 # memoises pure exact computations) and its own violation list.
-function run_db_check(m::DBModel; parallel::Bool=false, use_symmetry::Bool=true)
+function run_db_check(m::DBModel; parallel::Bool=false, use_symmetry::Bool=true,
+                      mode::Symbol=:detailed)
     chambers = enumerate_chambers(m); nA = m.nA
     nt = Threads.maxthreadid()
     caches = [Dict{Tuple{Int,Vector{Int}}, Val}() for _ in 1:nt]
@@ -1879,6 +1885,67 @@ function run_db_check(m::DBModel; parallel::Bool=false, use_symmetry::Bool=true)
             for (L,c) in bs_mul(bs_shift(v.num, ej), expand_binoms(ms_diff(D,v.den), nA)); bs_add!(res,L,poly_neg(c)); end
         end
         isempty(res)
+    end
+
+    # ---- GLOBAL BALANCE (mode=:balance) -------------------------------------
+    # Stationarity pi*T = pi is the COLUMN sum of the detailed-balance residual
+    # matrix: for each target state t,  B_t = sum_s [ pi_s T(s->t) - pi_t T(t->s) ] = 0
+    # (the s==t term cancels, so only off-diagonal transitions enter — exactly what the
+    # graph stores). Detailed balance is the STRONGER per-pair condition R_{st}=0; an
+    # algorithm can satisfy balance (correct sampling) while violating DB (the entire
+    # non-reversible family: event-chain, lifting, Suwa-Todo). Because the B_t sum mixes
+    # pairs with different (1-exp) denominators, we aggregate the directed leaf
+    # contributions over a COMMON denominator (not the per-pair-cleared numerators),
+    # so the test stays exact. B_{g.t} is identically zero iff B_t is (same verified
+    # group as the pair reduction), so one target per state-orbit suffices.
+    if mode === :balance
+        nS = length(m.energy_coeffs)
+        incident = [Tuple{Int,Int}[] for _ in 1:nS]      # incident[t] = [(pair, +1 if t==j else -1)]
+        for (p, (i,j)) in enumerate(m.pairs); push!(incident[j], (p, 1)); push!(incident[i], (p, -1)); end
+        function balance_zero(t::Int, σ::Vector{Int})
+            ws = Tuple{Int,Int,Int}[]                    # (weight-index, energy-state, sign)
+            for (p, s) in incident[t]
+                i, j = m.pairs[p]
+                if s > 0      # t == j:  +T(i->t)pi_i  - T(t->i)pi_t
+                    for wi in m.ij_srcs[p]; push!(ws, (wi, i, 1)); end
+                    for wi in m.ji_srcs[p]; push!(ws, (wi, t, -1)); end
+                else          # t == i:  +T(j->t)pi_j  - T(t->j)pi_t
+                    for wi in m.ji_srcs[p]; push!(ws, (wi, j, 1)); end
+                    for wi in m.ij_srcs[p]; push!(ws, (wi, t, -1)); end
+                end
+            end
+            D = BSum[]
+            for (wi,_,_) in ws; D = ms_unionmax(D, leaf_val(wi,σ).den); end
+            res = BSum()
+            for (wi, es, sgn) in ws
+                v = leaf_val(wi,σ)
+                term = bs_mul(bs_shift(v.num, m.energy_coeffs[es]), expand_binoms(ms_diff(D, v.den), nA))
+                for (L,c) in term; bs_add!(res, L, sgn > 0 ? c : poly_neg(c)); end
+            end
+            isempty(res)
+        end
+        targets = use_symmetry ? m.check_targets : collect(1:nS)
+        work_t  = Int[t for t in targets if !isempty(incident[t])]
+        bviol_per = [Tuple{Int,Int,Int}[] for _ in 1:nt]
+        function do_target(t::Int)
+            apset = Set{Int}()
+            for (p, _) in incident[t]
+                for wi in m.ij_srcs[p]; union!(apset, m.uw_active[wi]); end
+                for wi in m.ji_srcs[p]; union!(apset, m.uw_active[wi]); end
+            end
+            ap = sort(collect(apset)); seen = Set{Vector{Int}}(); out = bviol_per[Threads.threadid()]
+            for (ridx, σ) in enumerate(chambers)
+                proj = Int[σ[c] for c in ap]; proj in seen && continue; push!(seen, proj)
+                balance_zero(t, σ) || push!(out, (t, t, ridx))
+            end
+        end
+        if parallel && nt > 1
+            Threads.@threads :static for t in work_t; do_target(t); end
+        else
+            for t in work_t; do_target(t); end
+        end
+        bviol = isempty(bviol_per) ? Tuple{Int,Int,Int}[] : reduce(vcat, bviol_per)
+        return (isempty(bviol), bviol, length(chambers))
     end
 
     # Default: only one pair per graph-verified symmetry orbit (sound; faster).

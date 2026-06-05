@@ -118,4 +118,6 @@ end
 # Run it:   julia --project=. check.jl your_file.jl
 # Optional: -maxdepth N   (raise the path-length cap; default 30)
 #           -parallel     (use multiple CPU cores; needs `julia -t auto`)
+#           -balance      (check global balance pi*T=pi instead of the stronger
+#                          detailed balance — accepts correct non-reversible moves)
 # ----------------------------------------------------------------------------

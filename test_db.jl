@@ -215,6 +215,7 @@ EXPECT = [
     ("hop_repeated_species",        (true,  true,  true )),   # species reduction with repeated multiplicities [1,1,2,2]
     ("broken_species_halfbeta",     (true,  false, true )),   # species-dependent accept -> declined, DB FAIL caught
     ("swap_literal_species",        (true,  true,  false)),   # raw-label write -> covariance guard declines
+    ("directed_sweep",              (true,  false, false)),   # non-reversible: DB FAIL (balance PASS, see balance testset)
 ]
 
 function _run_pipeline(n, types, algo, energy; moves=nothing)
@@ -612,6 +613,44 @@ end
     @test r.species_free && !isempty(r.pg_idx)   # species AND point group both engaged
     @test r.db == r.db_full                       # symmetry reduction is verdict-neutral
     @test r.nbfs < length(states)                 # actually fewer states BFS'd
+end
+
+# Global balance (`-balance`): the COLUMN-sum condition pi*T = pi, which correct
+# sampling actually requires. It is strictly WEAKER than detailed balance (a
+# non-reversible chain can satisfy balance while violating DB), it is computed by the
+# SAME exact rational machinery (no floats), and the state-orbit reduction must equal
+# the all-targets baseline (sound; speed only).
+@testset "Global balance (-balance): weaker than DB, exact, reduced == full" begin
+    n = 3
+    runmodes(types, algo, en; mv=nothing) = begin
+        states = enumerate_states(types, n)
+        m = build_dbmodel(build_transitions(algo, en, states, n, 30; moves=mv), en)
+        (db       = run_db_check(m; mode=:detailed)[1],
+         bal      = run_db_check(m; mode=:balance)[1],
+         balfull  = run_db_check(m; mode=:balance, use_symmetry=false)[1],
+         ntargets = length(m.check_targets), nstates = length(states))
+    end
+
+    # directed_sweep: the canonical non-reversible chain -> DB FAIL but BALANCE PASS.
+    ds = load_example(joinpath(@__DIR__, "examples", "directed_sweep.jl"))
+    r  = Base.invokelatest(() -> runmodes(ds.PARTICLE_TYPES, ds.algorithm, ds.energy))
+    @test r.db == false                  # detailed balance fails (directed move)
+    @test r.bal == true                  # global balance holds (cyclic permutation -> uniform stationary)
+    @test r.bal == r.balfull             # state-orbit reduction == all-targets baseline
+    @test r.ntargets < r.nstates         # the reduction actually reduces
+
+    # DB ==> balance: a detailed-balance-PASS algorithm also passes balance, reduced
+    # check agreeing with the full baseline.
+    energy = mk_energy(n, 2)
+    rr = runmodes([1,2,3], mk_metropolis(n, 2, energy), energy)
+    @test rr.db == true && rr.bal == true
+    @test rr.bal == rr.balfull
+
+    # A DB-FAIL example: the column reduction is sound regardless of the verdict
+    # (reduced balance == full balance), and DB-FAIL does not imply balance-PASS.
+    bvp = load_example(joinpath(@__DIR__, "examples", "broken_variable_pool.jl"))
+    rb  = Base.invokelatest(() -> runmodes(bvp.PARTICLE_TYPES, bvp.algorithm, bvp.energy))
+    @test rb.bal == rb.balfull
 end
 
 end
