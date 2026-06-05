@@ -32,9 +32,9 @@ function algorithm(rng, state::PState)::PState
 
     (i, j) = rand_choice!(rng, pairs)
     ti, tj = state[i].t, state[j].t
-    newstate = PState([k == i ? Particle(state[k].r, state[k].c, tj) :
-                       k == j ? Particle(state[k].r, state[k].c, ti) :
-                       state[k] for k in 1:length(state)])
+    newstate = [k == i ? Particle(state[k].r, state[k].c, tj) :
+                k == j ? Particle(state[k].r, state[k].c, ti) :
+                state[k] for k in 1:length(state)]
 
     dE = linsub(energy(newstate), energy(state))
     metropolis!(rng, dE) ? newstate : state

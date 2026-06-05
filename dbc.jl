@@ -148,6 +148,11 @@ struct Atom
     name::Symbol
 end
 Jc(a::Int, b::Int, d2::Int) = a <= b ? Atom(true, a, b, d2, :_) : Atom(true, b, a, d2, :_)
+# Jc is a TRUSTED species primitive: building a coupling atom from two species
+# labels is equivariant, so a tagged label is unwrapped WITHOUT flagging (`_u` is
+# defined with TypeTag in SECTION 1b). The internal a<=b canonicalisation is atom
+# bookkeeping, not a user branch.
+Jc(a, b, d2::Int) = Jc(_u(a), _u(b), d2)
 Xparam(name::Symbol)        = Atom(false, 0, 0, 0, name)
 
 # Deterministic total order so the global atom list has a stable index.
@@ -193,16 +198,72 @@ end
 
 ratscale(f::RatForm, s::Q)::RatForm = RatForm(a => v*s for (a, v) in f)
 
+# ============================================================================
+# SECTION 1b — TypeTag: a species-label tag for certifying species-equivariance
+# ============================================================================
+# A permutation of the species labels relabels the (symbolic) coupling atoms, so
+# it is a symmetry of detailed balance when the algorithm is species-EQUIVARIANT.
+# To certify that from a SINGLE BFS — so the tau-BFS can be reduced over species
+# orbits, not just translation orbits — we run the BFS with each label wrapped in a
+# TypeTag that permits only EQUIVARIANT uses (equality between labels, hashing, and
+# atom construction via Jc) and FLAGS any use of the ABSOLUTE label (comparison to
+# a constant, ordering, arithmetic, coercion to Int). If a whole BFS runs unflagged
+# and every output label is itself an (inherited) tag, the move is species-
+# equivariant. This is the exact analogue of TauNum/`tau` for the discrete species
+# group. The flag is thread-local and deterministic, like the tau flag.
+#
+# Soundness rests on the same discipline as tau: the raw value `t.v` must not be
+# read inside an algorithm (it bypasses the tag). Reads via the documented API
+# (`p.t` used in `==`, `Jc`, carried into a new Particle) are safe; coercion to Int
+# is intercepted and flagged.
+struct TypeTag; v::Int; end
+TypeTag(t::TypeTag) = t                                   # idempotent
+
+const _SPECIES_BAD = [false]                              # thread-local, like _TAU
+const _SP_MSG      = [""]
+species_violation!(m::String) =
+    (i = Threads.threadid(); _SPECIES_BAD[i] = true; _SP_MSG[i] = m; nothing)
+
+# ALLOWED (species-equivariant) operations.
+Base.:(==)(a::TypeTag, b::TypeTag) = a.v == b.v
+Base.hash(a::TypeTag, h::UInt)     = hash(a.v, h)
+# FLAGGED operations (they depend on the absolute label, not the equality structure).
+Base.:(==)(a::TypeTag, b::Integer) = (species_violation!("species label compared to constant $b"); a.v == b)
+Base.:(==)(a::Integer, b::TypeTag) = (species_violation!("constant $a compared to species label"); a == b.v)
+Base.isless(a::TypeTag, b::TypeTag)  = (species_violation!("species labels ordered"); a.v < b.v)
+Base.isless(a::TypeTag, b::Integer)  = (species_violation!("species label ordered vs constant"); a.v < b)
+Base.isless(a::Integer, b::TypeTag)  = (species_violation!("constant ordered vs species label"); a < b.v)
+Base.convert(::Type{<:Integer}, t::TypeTag) = (species_violation!("species label coerced to Int"); t.v)
+_u(x::TypeTag) = x.v; _u(x) = x
+for op in (:+, :-, :*)
+    @eval Base.$op(a::TypeTag, b) = (species_violation!("species-label arithmetic ($($(QuoteNode(op))))"); $op(a.v, _u(b)))
+    @eval Base.$op(a, b::TypeTag) = (species_violation!("species-label arithmetic ($($(QuoteNode(op))))"); $op(_u(a), b.v))
+    @eval Base.$op(a::TypeTag, b::TypeTag) = (species_violation!("species-label arithmetic ($($(QuoteNode(op))))"); $op(a.v, b.v))
+end
+
 # ---- particles / states ----
-struct Particle
+# Particle is parametric in the species-label type T so the SAME user code can run
+# with plain Int labels (the fast default / concrete path) or with a tagged label
+# (TypeTag, used only to certify species-equivariance during the tau-BFS — see
+# SECTION 1b). PState is the supertype of both vector forms, so signatures and
+# `return ... ::PState` accept either without change.
+struct Particle{T}
     r::TauNum
     c::TauNum
-    t::Int
+    t::T
 end
-const PState = Vector{Particle}
+const PState = Vector{<:Particle}
 
-# tau-augment a concrete (r,c,type) seed particle along both axes.
-aug_particle(r::Int, c::Int, t::Int) = Particle(tau_r_aug(r), tau_c_aug(c), t)
+# tau-augment a concrete (r,c,type) seed particle along both axes. Two flavours:
+# the default uses a plain Int label (fast — used for the normal/fallback BFS); the
+# tagged flavour wraps the label in a TypeTag so non-species-equivariant uses are
+# detected (used only for the species-equivariance probe in SECTION 6).
+aug_particle(r::Int, c::Int, t::Int)     = Particle(tau_r_aug(r), tau_c_aug(c), t)
+aug_particle_tag(r::Int, c::Int, t::Int) = Particle(tau_r_aug(r), tau_c_aug(c), TypeTag(t))
+
+# Extract the integer species label from either a plain Int or a TypeTag.
+typeval(t::Int)::Int = t
+typeval(t::TypeTag)::Int = t.v
 
 # ---- geometry (all flag tau-violation if used on a tau-dependent value) ----
 
@@ -262,14 +323,19 @@ tau_violation!(msg::String) = (i = Threads.threadid(); _TAU[i] = true; _TAU_MSG[
 # thread pool means threadid() can exceed the default pool size.
 function _init_threadlocal!()
     nt = Threads.maxthreadid()
-    resize!(_TAU, nt);       fill!(_TAU, false)
-    resize!(_TAU_MSG, nt);   fill!(_TAU_MSG, "")
+    resize!(_TAU, nt);          fill!(_TAU, false)
+    resize!(_TAU_MSG, nt);      fill!(_TAU_MSG, "")
+    resize!(_SPECIES_BAD, nt);  fill!(_SPECIES_BAD, false)
+    resize!(_SP_MSG, nt);       fill!(_SP_MSG, "")
     resize!(_TH_CACHES, nt)
     for i in 1:nt; _TH_CACHES[i] = Dict{Any,ThExpr}(); end
     nothing
 end
 _tau_any()  = any(_TAU)
 _tau_first_msg() = (i = findfirst(!isempty, _TAU_MSG); i === nothing ? "" : _TAU_MSG[i])
+_species_clear!() = (for i in eachindex(_SPECIES_BAD); _SPECIES_BAD[i] = false; _SP_MSG[i] = ""; end)
+_species_any()  = any(_SPECIES_BAD)
+_species_first_msg() = (i = findfirst(!isempty, _SP_MSG); i === nothing ? "" : _SP_MSG[i])
 
 # ----------------------------------------------------------------------------
 # Exact rational functions of exp-monomials (BSum / Val)
@@ -537,7 +603,7 @@ intval(x::TauNum)::Int = (denominator(tau0(x)) == 1 ?
 # algorithm's next state is translation-COVARIANT (it shifts with the lattice),
 # which is expected and must NOT be flagged.
 function norm_state(s::PState, n::Int)::CState
-    cs = NTuple{3,Int}[(mod(intval(p.r) - 1, n) + 1, mod(intval(p.c) - 1, n) + 1, p.t)
+    cs = NTuple{3,Int}[(mod(intval(p.r) - 1, n) + 1, mod(intval(p.c) - 1, n) + 1, typeval(p.t))
                        for p in s]
     sort!(cs)
     cs
@@ -555,6 +621,7 @@ end
 function build_state_leaves(algo, seed::PState, n::Int, maxdepth::Int)::Vector{Leaf}
     leaves = Leaf[]
     queue  = Vector{Int}[Int[]]
+    tagged = eltype(seed) <: Particle{TypeTag}      # species probe? (then check covariance)
     while !isempty(queue)
         bits = popfirst!(queue)
         rng  = BitSeqRNG(bits)
@@ -564,6 +631,11 @@ function build_state_leaves(algo, seed::PState, n::Int, maxdepth::Int)::Vector{L
                 is_covariant_pos(p) ||
                     tau_violation!("a next-state position is not a pure lattice translation " *
                                    "of the input (absolute, reflected, or nonlinear move)")
+                # species-covariance: an output label must be an INHERITED tag, not a
+                # fresh literal (which would not relabel under a species permutation).
+                tagged && !(p.t isa TypeTag) &&
+                    species_violation!("a next-state species label is a fresh literal, " *
+                                       "not an inherited label (non-equivariant)")
             end
             push!(leaves, Leaf(norm_state(nxt, n), rng.coeff, copy(rng.factors)))
         catch e
@@ -664,10 +736,12 @@ function _counts(xs)
     d
 end
 
-# Concrete state -> tau-FREE PState (for energy evaluation of real states).
-concrete_pstate(cs::CState)::PState = PState([Particle(TauNum(r), TauNum(c), t) for (r, c, t) in cs])
-# Concrete state -> tau-AUGMENTED PState (BFS seed for the tau-check).
-augmented_pstate(cs::CState)::PState = PState([aug_particle(r, c, t) for (r, c, t) in cs])
+# Concrete state -> tau-FREE PState with Int labels (for energy of real states).
+concrete_pstate(cs::CState)::PState = Particle{Int}[Particle(TauNum(r), TauNum(c), t) for (r, c, t) in cs]
+# Concrete state -> tau-AUGMENTED PState with Int labels (the normal BFS seed).
+augmented_pstate(cs::CState)::PState = Particle{Int}[aug_particle(r, c, t) for (r, c, t) in cs]
+# Same, but with TAGGED labels (used only for the species-equivariance probe).
+augmented_pstate_tag(cs::CState)::PState = Particle{TypeTag}[aug_particle_tag(r, c, t) for (r, c, t) in cs]
 
 # ============================================================================
 # SECTION 6 — Transition build (translation-orbit reduction) + ergodicity
@@ -739,33 +813,82 @@ function translation_orbits(states::Vector{CState}, n::Int)
     reps, repof, gof
 end
 
+# Relabel a concrete state's species by sigma.
+relabel_cstate(cs::CState, σ::Dict{Int,Int})::CState =
+    sort(NTuple{3,Int}[(r, c, σ[t]) for (r, c, t) in cs])
+
+# All species permutations preserving the type-multiset (identity first). For
+# all-distinct labels this is the full symmetric group; for repeated labels it is
+# the product of symmetric groups over equal-multiplicity classes.
+function _all_perms(v::Vector{Int})
+    length(v) <= 1 && return [v]
+    out = Vector{Int}[]
+    for i in eachindex(v)
+        for p in _all_perms(v[[j for j in eachindex(v) if j != i]]); push!(out, vcat(v[i], p)); end
+    end
+    out
+end
+function _type_group_full(typemult::Vector{Int})
+    cnt = Dict{Int,Int}(); for t in typemult; cnt[t] = get(cnt,t,0)+1; end
+    labels = sort(collect(keys(cnt)))
+    grp = Dict{Int,Int}[]
+    for p in _all_perms(labels)
+        σ = Dict(labels[i] => p[i] for i in eachindex(labels))
+        all(cnt[t] == cnt[σ[t]] for t in labels) && push!(grp, σ)
+    end
+    id = Dict(t => t for t in labels)
+    sort!(grp; by = σ -> (σ == id ? 0 : 1))      # identity first
+    grp
+end
+
+# Orbits of the translation representatives under the species group. Returns, for
+# each translation rep `tr`, a pair (combined_rep, k) with combined_rep a chosen
+# translation rep and k the index in σgroup such that
+# repof_t[relabel(combined_rep, σ_k)] == tr; plus the list of combined reps.
+function combined_trep_orbits(treps::Vector{CState}, repof_t::Dict{CState,CState},
+                              σgroup::Vector{Dict{Int,Int}})
+    crep_of = Dict{CState,CState}(); k_of = Dict{CState,Int}(); creps = CState[]
+    for tr in treps
+        haskey(crep_of, tr) && continue
+        push!(creps, tr)
+        for (k, σ) in enumerate(σgroup)
+            tr2 = repof_t[relabel_cstate(tr, σ)]
+            if !haskey(crep_of, tr2); crep_of[tr2] = tr; k_of[tr2] = k; end
+        end
+    end
+    creps, crep_of, k_of
+end
+
 struct BFSResult
-    states   :: Vector{CState}
-    idx      :: Dict{CState,Int}
-    uweights :: Vector{Leaf}                 # unique (representative) leaf weights
-    trans    :: Vector{Tuple{Int,Int,Int}}   # (src, dst, weight-index), src != dst
-    tau_free :: Bool
-    tau_msg  :: String
-    n        :: Int                          # lattice side (for symmetry actions)
+    states       :: Vector{CState}
+    idx          :: Dict{CState,Int}
+    uweights     :: Vector{Leaf}                 # unique (representative) leaf weights
+    trans        :: Vector{Tuple{Int,Int,Int}}   # (src, dst, weight-index), src != dst
+    tau_free     :: Bool
+    tau_msg      :: String
+    n            :: Int                          # lattice side (for symmetry actions)
+    species_free :: Bool                         # species-equivariant BFS reduction used?
+    nbfs         :: Int                          # number of states actually BFS'd
 end
 
 # BFS a list of seed states, optionally across threads. Each thread uses its own
 # interning cache and tau flag (set up by _init_threadlocal!), so the only shared
 # output is the per-seed leaf vector written to a preallocated slot. A CantHandle
 # raised inside a worker is unwrapped and rethrown so check.jl can report it.
-function _bfs_seeds(algo, seeds::Vector{CState}, n::Int, maxdepth::Int, parallel::Bool)
+function _bfs_seeds(algo, seeds::Vector{CState}, n::Int, maxdepth::Int, parallel::Bool;
+                   seedfn = augmented_pstate)
     out = Vector{Vector{Leaf}}(undef, length(seeds))
     if parallel && Threads.nthreads() > 1
         try
             Threads.@threads :static for i in 1:length(seeds)
-                out[i] = build_state_leaves(algo, augmented_pstate(seeds[i]), n, maxdepth)
+                out[i] = build_state_leaves(algo, seedfn(seeds[i]), n, maxdepth)
             end
         catch e
             throw(_unwrap_cant(e))
         end
     else
         for i in 1:length(seeds)
-            out[i] = build_state_leaves(algo, augmented_pstate(seeds[i]), n, maxdepth)
+            out[i] = build_state_leaves(algo, seedfn(seeds[i]), n, maxdepth)
         end
     end
     out
@@ -779,47 +902,97 @@ function _unwrap_cant(e)
 end
 
 function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdepth::Int;
-                           parallel::Bool=false)::BFSResult
-    _init_threadlocal!()                    # fresh per-thread interning + tau flags
+                           parallel::Bool=false, species::Bool=true)::BFSResult
+    _init_threadlocal!()                    # fresh per-thread interning + tau/species flags
     idx = Dict(cs => i for (i, cs) in enumerate(states))
     uweights = Leaf[]; uw_idx = Dict{Any,Int}()
     widx!(lf::Leaf) = get!(uw_idx, _weight_key(lf)) do; push!(uweights, lf); length(uweights) end
     trans = Tuple{Int,Int,Int}[]
 
-    reps, repof, gof = translation_orbits(states, n)
-    rep_leaf_vec = _bfs_seeds(algo, reps, n, maxdepth, parallel)
-    rep_leaves = Dict{CState,Vector{Leaf}}(reps[i] => rep_leaf_vec[i] for i in eachindex(reps))
+    treps, repof, gof = translation_orbits(states, n)
+    σgroup = species ? _type_group_full(Int[t for (r,c,t) in states[1]]) : Dict{Int,Int}[Dict()]
+    rep_leaves = Dict{CState,Vector{Leaf}}()
+
+    # --- attempt the COMBINED (translation x species) BFS reduction --------------
+    # When the algorithm is species-equivariant we BFS one rep per COMBINED orbit
+    # (far fewer than per translation orbit) using TAGGED labels, which certify
+    # species-equivariance from that single BFS. If certified, every other state's
+    # transitions are derived by translating AND species-relabeling a rep's leaves.
+    if length(σgroup) > 1
+        creps, crep_of, k_of = combined_trep_orbits(treps, repof, σgroup)
+        _species_clear!()
+        # The tagged probe may hit an un-overloaded label operation (e.g. `p.t ^ 2`)
+        # and throw a MethodError. That is not a failure of the checker — it just
+        # means species-equivariance cannot be certified — so treat ANY non-CantHandle
+        # error as "decline species" and fall back. CantHandle (e.g. maxdepth) is a
+        # genuine limit and propagates. (The fallback BFS uses Int labels, so a real
+        # bug in the algorithm still surfaces there.)
+        probe_ok = true
+        try
+            crep_leaf_vec = _bfs_seeds(algo, creps, n, maxdepth, parallel; seedfn = augmented_pstate_tag)
+            for i in eachindex(creps); rep_leaves[creps[i]] = crep_leaf_vec[i]; end
+        catch e
+            (e isa CantHandle) && rethrow(e)
+            probe_ok = false; empty!(rep_leaves); _init_threadlocal!()   # discard probe state
+        end
+        if probe_ok && !_tau_any() && !_species_any()
+            # CERTIFIED species-equivariant: derive all states from the combined reps.
+            # Precompute, per species element, the relabeled-weight index of each
+            # combined-rep leaf (translation does not change weights).
+            wi_of = IdDict{Leaf,Int}()
+            for r in creps, lf in rep_leaves[r]; wi_of[lf] = widx!(lf); end
+            wcache = Dict{Tuple{Int,Int},Int}()                 # (base wi, σ-index k) -> wi
+            permwi(wi::Int, lf::Leaf, k::Int) = k == 1 ? wi : get!(wcache, (wi, k)) do
+                σ = σgroup[k]
+                widx!(Leaf(lf.next, lf.coeff,
+                           ThFactor[ThFactor(permute_atoms_th(f.thr, σ), f.accepted) for f in lf.factors]))
+            end
+            for (s, si) in idx
+                tr = repof[s]; cr = crep_of[tr]; k = k_of[tr]; σ = σgroup[k]
+                a  = gof[relabel_cstate(cr, σ)]                 # relabel(cr,σ) = translate(tr, a)
+                dr = mod(gof[s][1] - a[1], n); dc = mod(gof[s][2] - a[2], n)
+                for lf in rep_leaves[cr]
+                    nxt = translate_cstate(relabel_cstate(lf.next, σ), dr, dc, n)
+                    dst = idx[nxt]
+                    dst != si && push!(trans, (si, dst, permwi(wi_of[lf], lf, k)))
+                end
+            end
+            return BFSResult(states, idx, uweights, trans, true, "", n, true, length(creps))
+        end
+        # Not certified: keep the combined reps' leaves (tags don't change leaves)
+        # and fall through, BFS-ing only the remaining translation reps below.
+    end
+
+    # --- translation-only reduction / all-states fallback -----------------------
+    need = CState[tr for tr in treps if !haskey(rep_leaves, tr)]
+    extra = _bfs_seeds(algo, need, n, maxdepth, parallel)
+    for i in eachindex(need); rep_leaves[need[i]] = extra[i]; end
     tau_free = !_tau_any(); tau_msg = _tau_first_msg()
 
     if tau_free
-        # Orbit reduction (sound here: the covariance + tau checks guarantee the
-        # transition matrix is genuinely translation-equivariant — see SECTION 6
-        # header). Dedup the rep weights once, then translate each rep leaf to
-        # every orbit member.
         wi_of = IdDict{Leaf,Int}()
-        for rep in reps, lf in rep_leaves[rep]; wi_of[lf] = widx!(lf); end
+        for tr in treps, lf in rep_leaves[tr]; wi_of[lf] = widx!(lf); end
         for (s, si) in idx
-            rep = repof[s]; (dr, dc) = gof[s]
-            for lf in rep_leaves[rep]
+            tr = repof[s]; (dr, dc) = gof[s]
+            for lf in rep_leaves[tr]
                 dst = idx[translate_cstate(lf.next, dr, dc, n)]
                 dst != si && push!(trans, (si, dst, wi_of[lf]))
             end
         end
-    else
-        # Fallback: direct BFS from EVERY state (no equivariance assumed). Correct
-        # for any algorithm, translation-invariant or not.
-        need = CState[s for s in states if !haskey(rep_leaves, s)]
-        extra = _bfs_seeds(algo, need, n, maxdepth, parallel)
-        extra_d = Dict{CState,Vector{Leaf}}(need[i] => extra[i] for i in eachindex(need))
-        for (s, si) in idx
-            lvs = haskey(rep_leaves, s) ? rep_leaves[s] : extra_d[s]
-            for lf in lvs
-                wi = widx!(lf); dst = idx[lf.next]
-                dst != si && push!(trans, (si, dst, wi))
-            end
+        return BFSResult(states, idx, uweights, trans, true, tau_msg, n, false, length(treps))
+    end
+
+    # Not translation invariant: direct BFS from EVERY state (no equivariance).
+    moreneed = CState[s for s in states if !haskey(rep_leaves, s)]
+    moreextra = _bfs_seeds(algo, moreneed, n, maxdepth, parallel)
+    for i in eachindex(moreneed); rep_leaves[moreneed[i]] = moreextra[i]; end
+    for (s, si) in idx
+        for lf in rep_leaves[s]
+            wi = widx!(lf); dst = idx[lf.next]
+            dst != si && push!(trans, (si, dst, wi))
         end
     end
-    BFSResult(states, idx, uweights, trans, tau_free, tau_msg, n)
+    BFSResult(states, idx, uweights, trans, false, tau_msg, n, false, length(states))
 end
 
 # Reachability ergodicity: BFS over the directed transition graph from the seed.

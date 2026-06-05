@@ -106,9 +106,10 @@ Translational invariance is **always reported**; it does not by itself fail the
 run (an absolute-field algorithm like `quadratic_field` is correctly τ-FAIL yet
 DB-PASS). Both lattice symmetry (translations + the square point group p4m) **and
 species-permutation symmetry** (relabeling the particle types, which permutes the
-symbolic couplings) are exploited to speed the detailed-balance check — but only
-after being **verified on the computed transition graph**, so the algorithm itself
-is never trusted (see "How it works" §6). Any subgroup is discovered automatically.
+symbolic couplings) are exploited to speed the check — species symmetry reduces both
+the τ-BFS (via a τ-style label tag, §2) and the detailed-balance pair check (§6).
+Both are **verified** (on a single BFS, or on the computed transition graph), so the
+algorithm itself is never trusted, and any subgroup is discovered automatically.
 
 ---
 
@@ -136,9 +137,19 @@ of the translational verdict.
 
 Every next-state position is additionally checked to be a genuine
 **translation-covariant** lattice position (it shifts *with* the lattice). This is
-what makes the orbit-reduction speed-up (below) sound: it is only ever applied to
-an algorithm whose transitions are provably translation-equivariant; anything else
-(a reflected or absolute move) is flagged and falls back to the all-states path.
+what makes the orbit-reduction speed-up sound: it is only ever applied to an
+algorithm whose transitions are provably translation-equivariant; anything else (a
+reflected or absolute move) is flagged and falls back to the all-states path.
+
+The BFS is further reduced over **species (type-permutation) orbits** when the
+algorithm is species-equivariant. During the BFS each species label is wrapped in a
+*tag* (the discrete analogue of `τ`): label-equality, hashing and `Jc` are allowed,
+but any use of the *absolute* label (compare-to-constant, ordering, arithmetic, or
+emitting a fresh-literal output label) is flagged. An unflagged BFS certifies
+species-equivariance, so one representative per **combined (translation × species)
+orbit** is BFS'd and the rest are derived by translating *and* relabeling — e.g.
+56→12 reps. A flag makes the checker fall back (sound; it never assumes). The
+derivation is validated to reproduce the direct-build graph exactly.
 
 ### 3. Exact symbolic weights (and the faithful VMMC ratio)
 A leaf weight is a rational coefficient times a product of acceptance factors.
@@ -217,9 +228,13 @@ The test suite checks every example's reduced verdict against the all-pairs base
   projection of the chambers onto its few active conditions, not once per chamber.
 - **Lazy, cached weight evaluation** and **hash-consed thresholds** so the model
   is built from unique weights, deduplicated by object identity.
-- **Translation-orbit reduction (BFS):** one representative per translation orbit
-  is BFS'd and its leaves are translated to the rest — sound because the covariance
-  check guarantees equivariance (falls back to all-states otherwise).
+- **Translation + species orbit reduction (BFS — the bottleneck):** one
+  representative per *combined* (translation × species) orbit is BFS'd and its leaves
+  are translated *and* species-relabeled to the rest. Translation-equivariance is
+  certified by `τ` + the position-covariance guard; species-equivariance by a `τ`-style
+  **species tag** + a species-covariance guard, both during that single BFS. Falls
+  back to translation-only (then all-states) if a guard fires. E.g. a randomised-order
+  VMMC drops 56→12 reps; declining algorithms (sorted VMMC) are unaffected.
 - **Graph-verified symmetry reduction (DB check):** detailed balance is evaluated
   on one pair per orbit of the verified `(spatial p4m) × (species permutation)`
   group (§6) — any subgroup is discovered automatically from the computed graph.
@@ -235,81 +250,108 @@ The test suite checks every example's reduced verdict against the all-pairs base
 ## Examples & timings
 
 All examples live in `examples/`. Verdicts and chamber counts below are the exact
-results. The **DB pairs** column shows how many pairs the graph-verified symmetry
-reduction actually checks versus the total. The `sym` column lists the verified
+results. **BFS'd** = states actually enumerated by the τ-BFS vs the total (the
+translation- and species-orbit reduction); **DB pairs** = pairs the graph-verified
+symmetry reduction checks vs the total. The `sym` column lists the verified
 **spatial** group (T = translations, D4 = full point group, T_c = column-only,
 D2 = `{rot180, reflect_h, reflect_v}`) and the verified **species** group acting on
 the type labels (`S₃`, `S₂`, …).
 
-| Example | Trans. | Detailed balance | Ergodicity | states | chambers | DB pairs | sym (spatial × species) |
+| Example | Trans. | Detailed balance | Ergodicity | states | BFS'd | DB pairs | sym (spatial × species) |
 |---|---|---|---|---|---|---|---|
-| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 48 | 16 / 4536 | p4m × S₃ |
-| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 6 | 6 / 756 | p4m × S₃ |
-| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 6 | 4 / 16 | T_c, reflect_v × S₂ |
-| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 1 | 3 / 252 | p4m × S₂ |
-| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 1 | 10 / 1792 | p4m × S₂ |
-| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 48 | 46 / 4536 | T, reflect_h × S₃ |
-| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 48 | 16 / 4536 | p4m × S₃ |
-| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 2 | 4 / 16 | T_c, reflect_v × S₂ |
-| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 216 | 174 / 11088 | p4m (species n/a) |
-| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 1 | 10 / 1792 | p4m × S₂ |
-| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 24 | 10 / 1792 | p4m × S₂ |
-| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 1 | 4 / 42 | T_c, reflect_v × S₂ |
-| `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 6 | 3 / 126 | **D2** × S₂ |
-| `barker_accept.jl` | PASS | PASS | PASS | 504 | 1 | 16 / 4536 | p4m × S₃ |
-| `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 48 | 16 / 4536 | p4m × S₃ |
+| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
+| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 12 | 6 / 756 | p4m × S₃ |
+| `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 12 | 4 / 16 | T_c, reflect_v × S₂ |
+| `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 4 | 3 / 252 | p4m × S₂ |
+| `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 9 | 10 / 1792 | p4m × S₂ |
+| `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 12 | 46 / 4536 | T, reflect_h × S₃ |
+| `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
+| `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 3 | 4 / 16 | T_c, reflect_v × S₂ |
+| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 56 | 174 / 11088 | p4m (species declined) |
+| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 9 | 10 / 1792 | p4m × S₂ |
+| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 9 | 10 / 1792 | p4m × S₂ |
+| `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 72 | 4 / 42 | T_c, reflect_v × S₂ |
+| `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 4 | 3 / 126 | **D2** × S₂ |
+| `barker_accept.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
+| `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
+| `vmmc_2d_shuffle.jl` | PASS | PASS | PASS | 504 | 12 | 44 / 11088 | p4m × S₃ |
+| `hop_repeated_species.jl` | PASS | PASS | PASS | 756 | 42 | … | p4m × **S₂ (1↔2)** |
+| `broken_species_halfbeta.jl` | PASS | **FAIL** (species-dep. `β/2`) | PASS | 504 | 56 | … | T·D4 (species declined) |
+| `swap_literal_species.jl` | PASS | PASS | FAIL (N! perms) | 504 | 56 | … | T·D4 (species declined) |
 
-The `sym` column shows exactly what the *graph* has, not what was assumed.
+The last four are particle-swap / species edge cases (see "Species symmetry" below).
+`vmmc_2d_shuffle` is the headline: replacing VMMC's type-dependent candidate sort
+with a random shuffle makes it **species-equivariant**, so the BFS drops 56→12 reps
+(warm ≈6.3 s → ≈2.5 s). `vmmc_2d` itself **declines** species (its sort tie-breaks
+on the type label). The `sym` column shows exactly what the *graph* has, not what
+was assumed.
 `broken_biased_direction` gets `reflect_h` but not `reflect_v`/`rotate90` (the
 column bias survives a row-flip, not a column-flip). The row-field examples
 (`quadratic_field`, `broken_field_wrong_accept`, `reflect_move`) get column
 translation + `reflect_v` only. `horizontal_metropolis` has **D2 not D4**.
 
-**Species (type) symmetry.** A permutation of the species labels relabels the
-symbolic coupling atoms, so it is a symmetry of the DB problem when the algorithm
-is species-equivariant — verified on the computed graph *up to that atom relabeling*
-(§6). All-distinct triples (`[1,2,3]`) give `S₃` (a further 3–6× on top of p4m);
-`[1,2]` gives `S₂`. `vmmc_2d` gets **no** species symmetry: its cluster builder
-tie-breaks candidate order on the type label, so it is not *leaf-level*
-species-equivariant and the checker conservatively declines (sound — it never
-assumes). The reductions cut the *pair count* substantially (e.g. single-Metropolis
-72→16) though wall-time gain is bounded because the DB cost is dominated by the
-distinct-weight evaluations, not the pair count.
+**Species (type) symmetry — reduces BOTH the BFS and the DB check.** A permutation
+of the species labels relabels the symbolic coupling atoms, so it is a symmetry of
+the DB problem when the algorithm is species-equivariant. It is used in two places,
+both sound (never trusting the algorithm):
 
-Four are deliberate edge cases: a correct power-of-two pool on 4×4
-(`hop_8way_correct`); a larger interacting 4×4 system (`metropolis_4x4`); a
-non-translation-covariant move (`reflect_move`, see AUDIT.md §5.3); and
-**`horizontal_metropolis`** — the critical example showing that point-group
-symmetry and detailed balance are logically independent: this algorithm has D2
-symmetry (not D4) yet DB-PASS. Failing `rotate90` on the graph is *never*
-interpreted as a DB verdict.
+- **τ-BFS reduction (the bottleneck).** During the BFS each label is wrapped in a
+  *tag* (the species analogue of `τ`): equality between labels, hashing and `Jc`
+  atom-construction are allowed, but any use of the *absolute* label (compare to a
+  constant, order, arithmetic) is flagged, and every output label must be an
+  inherited tag (species-covariance, the analogue of the position-covariance guard).
+  If a representative's BFS runs unflagged it is certified species-equivariant, so
+  the BFS runs one rep per **combined (translation × species) orbit** and derives
+  the rest by translating *and* relabeling — e.g. 56→12 reps for the S₃ cases.
+- **DB-pair reduction.** The same symmetry, re-verified on the *computed graph* up
+  to the atom relabeling (§6), checks one pair per orbit.
+
+All-distinct triples (`[1,2,3]`) give `S₃`; `[1,2]` and equal-multiplicity pairs
+like `[1,1,2,2]` give `S₂`; unequal multiplicities give none. `vmmc_2d` declines
+(its cluster sort tie-breaks on the type label, so it is not *leaf-level*
+species-equivariant — sound, never assumed); `vmmc_2d_shuffle` (random order)
+does not, and gets the full reduction.
+
+Edge-case examples: a correct power-of-two pool on 4×4 (`hop_8way_correct`); a
+larger 4×4 system (`metropolis_4x4`); a non-translation-covariant move
+(`reflect_move`, AUDIT §5.3); **`horizontal_metropolis`** — point-group symmetry
+and DB are independent (D2 not D4, yet DB-PASS); and four **particle-swap / species**
+cases: `vmmc_2d_shuffle` (species-equivariant VMMC), `hop_repeated_species`
+(`[1,1,2,2]`, repeated-multiplicity S₂), `broken_species_halfbeta` (species-dependent
+acceptance → species declined, DB-FAIL still caught), and `swap_literal_species`
+(a swap that writes raw labels → the species-covariance guard declines, DB still
+correct). The species reduction is validated to produce a transition graph
+*identical* to a direct build (the suite compares them at random coupling points).
 
 `barker_accept` and `poly_rate_accept` exercise the extended weight algebra: Barker
 acceptance uses a `1+exp` denominator (no conditions, so a single chamber), and the
 rate-limited Metropolis carries a polynomial coupling factor (`a`, the 7th atom)
 times the Boltzmann exponentials.
 
-**Warm compute (JIT excluded), serial** on an Apple-silicon laptop. The `model`
-phase now also runs the species-symmetry verification (permuting + re-interning
-weights); for a species-equivariant case like single-Metropolis that is ~0.1 s,
-and for VMMC it bails immediately (declined).
+**Warm compute (JIT excluded), serial** on an Apple-silicon laptop. The BFS phase
+benefits from the species-orbit reduction where it applies (fewer reps); the `model`
+phase runs the species verification (a quick bail when declined).
 
-| Example | BFS | model | DB check | total |
-|---|---|---|---|---|
-| `single_metropolis.jl` | 0.2 s | 0.10 s | 1.1 s | ≈ 1.4 s |
-| `metropolis_4x4.jl` | 0.03 s | 0.01 s | 0.23 s | ≈ 0.3 s |
-| `barker_accept.jl` | 0.2 s | 0.02 s | ~0 s | ≈ 0.2 s |
-| `poly_rate_accept.jl` | 0.4 s | 0.02 s | 1.4 s | ≈ 1.8 s |
-| `kawasaki.jl` | 0.02 s | 0.01 s | ~0 s | ≈ 0.03 s |
-| `vmmc_2d.jl` | 3.0 s | 0.05 s | 1.0 s | ≈ 4.1 s |
+| Example | BFS | model | DB check | total | BFS'd |
+|---|---|---|---|---|---|
+| `single_metropolis.jl` | 0.08 s | 0.02 s | 1.3 s | ≈ 1.4 s | 12/504 |
+| `kawasaki.jl` | 0.01 s | 0.14 s | ~0 s | ≈ 0.16 s | 12/504 |
+| `metropolis_4x4.jl` | 0.03 s | 0.01 s | 0.27 s | ≈ 0.3 s | 9/240 |
+| `hop_repeated_species.jl` | 0.04 s | 0.01 s | ~0 s | ≈ 0.06 s | 42/756 |
+| `barker_accept.jl` | 0.05 s | 0.17 s | ~0 s | ≈ 0.2 s | 12/504 |
+| `poly_rate_accept.jl` | 0.17 s | 0.03 s | 1.5 s | ≈ 1.7 s | 12/504 |
+| `vmmc_2d_shuffle.jl` | 1.5 s | 0.14 s | 0.9 s | ≈ 2.5 s | 12/504 |
+| `vmmc_2d.jl` | 3.5 s | 0.10 s | 1.3 s | ≈ 4.9 s | 56/504 |
 
-The polynomial-coefficient ring and `1+exp` denominators add no measurable cost to
-the existing cases (constant coefficients take a fast path). The graph-verified
-symmetry reduction makes the VMMC DB check ≈2× faster (≈1.1 s vs ≈2.1 s checking all
-pairs). With `-parallel` on 8 threads the VMMC BFS drops to ≈1 s. A single cold
-`check.jl` invocation additionally pays **~13–18 s of Julia JIT compilation** (the
-engine is recompiled per process); the regression suite amortises this across all
-examples, and a `PackageCompiler.jl` system image removes it entirely (below).
+The **species τ-BFS reduction** is the headline: a species-equivariant algorithm
+BFSes one rep per combined orbit, e.g. `vmmc_2d_shuffle` (a *typical* randomised-order
+VMMC) drops from ≈6.3 s to ≈2.5 s and `single_metropolis` BFS from 0.18 s to 0.08 s;
+`vmmc_2d` (declines species) is unchanged. The polynomial-coefficient ring and
+`1+exp` denominators add no measurable cost (constant coefficients take a fast path).
+With `-parallel` on 8 threads the VMMC BFS drops further. A single cold `check.jl`
+invocation additionally pays **~13–18 s of Julia JIT compilation** (the engine is
+recompiled per process); the regression suite amortises this, and a
+`PackageCompiler.jl` system image removes it entirely (below).
 
 ### Removing the JIT warm-up (optional)
 Most of the wall-clock for the small cases is Julia compiling the engine afresh
@@ -349,9 +391,9 @@ whenever it meets something it cannot represent exactly:
 | `check.jl` | command-line driver (`[-maxdepth N] [-parallel]`) |
 | `test_db.jl` | unit + fail-loud + end-to-end example suite |
 | `TEMPLATE.jl` | annotated template for writing your own algorithm |
-| `examples/` | fifteen worked translations (standard algorithms + edge cases) |
+| `examples/` | nineteen worked translations (standard algorithms + symmetry / weight-class / particle-swap edge cases) |
 | `AUDIT.md` | critical soundness/performance audit and how each issue is addressed |
 | `doc/expressiveness.md` | the exact class of weight/energy/condition functions handled |
 | `ideas.md` | analysis of inductive generalisation across system sizes, and D4 |
-| `type-taint.md` + `doc/typetaint_poc.jl` | investigation of a species-equivariance certificate for the BFS (with PoC) |
+| `type-taint.md` + `doc/typetaint_poc.jl` | the species-equivariance certificate for the BFS (PoC + the analysis that led to it; now implemented) |
 | `doc/dbc_method.{tex,pdf}` | a 2-page method writeup |

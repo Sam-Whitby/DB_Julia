@@ -189,6 +189,10 @@ EXPECT = [
     ("horizontal_metropolis",       (true,  true,  false)),   # D2 not D4; erg FAIL by design
     ("barker_accept",               (true,  true,  true )),   # (1+exp) denominator (Tier 1)
     ("poly_rate_accept",            (true,  true,  true )),   # polynomial weight factor (Tier 2)
+    ("vmmc_2d_shuffle",             (true,  true,  true )),   # random candidate order -> species-equivariant VMMC
+    ("hop_repeated_species",        (true,  true,  true )),   # species reduction with repeated multiplicities [1,1,2,2]
+    ("broken_species_halfbeta",     (true,  false, true )),   # species-dependent accept -> declined, DB FAIL caught
+    ("swap_literal_species",        (true,  true,  false)),   # raw-label write -> covariance guard declines
 ]
 
 function _run_pipeline(n, types, algo, energy)
@@ -201,7 +205,35 @@ function _run_pipeline(n, types, algo, energy)
     cnt = length(states) == theoretical_count(types, n)
     (tau=bfs.tau_free, db=pass_r, erg=erg.ergodic, count=cnt,
      db_full=pass_f, ch_eq=(ch_r == ch_f), sym=m.sym_names,
-     npairs=length(m.pairs), nreps=length(m.check_pairs))
+     npairs=length(m.pairs), nreps=length(m.check_pairs),
+     species_free=bfs.species_free, nbfs=bfs.nbfs)
+end
+
+# The species (combined-orbit) BFS reduction must produce EXACTLY the same
+# transition graph as a direct build with the reduction OFF. The DB-pair `==full`
+# test cannot see this (it reuses one graph), so we compare the two graphs' actual
+# transition probabilities at random coupling points — an independent check of the
+# species-relabel + atom-permute expansion. Returns (graphs_equal, db_equal,
+# species_free_on, nbfs_on, nbfs_off).
+function _species_graph_consistency(n, types, algo, energy)
+    states = enumerate_states(types, n)
+    bon  = build_transitions(algo, energy, states, n, 30; species=true)
+    boff = build_transitions(algo, energy, states, n, 30; species=false)
+    atoms = Set{Atom}()
+    for b in (bon, boff), lf in b.uweights, f in lf.factors; _collect_atoms_th!(atoms, f.thr); end
+    tmat(b, J) = (T = Dict{Tuple{Int,Int},Float64}();
+                  for (s,d,wi) in b.trans; T[(s,d)] = get(T,(s,d),0.0) + eval_leaf(b.uweights[wi], J, 1.0); end; T)
+    geq = true
+    Random.seed!(12345)
+    for _ in 1:4
+        J = Dict{Atom,Float64}(a => rand()*2 - 1 for a in atoms)
+        T1 = tmat(bon, J); T2 = tmat(boff, J)
+        (keys(T1) == keys(T2)) || (geq = false)
+        for k in keys(T1); abs(T1[k] - get(T2, k, 0.0)) < 1e-7 || (geq = false); end
+    end
+    db_on,  _, _ = run_db_check(build_dbmodel(bon, energy))
+    db_off, _, _ = run_db_check(build_dbmodel(boff, energy))
+    (geq, db_on == db_off, bon.species_free, bon.nbfs, boff.nbfs)
 end
 function run_example(path)
     Base.include(Main, path)                         # (re)defines NGRID/energy/algorithm
@@ -378,6 +410,52 @@ end
     @test ("type(2<->3)" in m_only1.sym_names)                   # spectator swap IS a symmetry
     @test !("type(1<->2)" in m_only1.sym_names)                  # privileged species is not swappable
     @test eqfull(m_only1)                                        # verdict still correct
+end
+
+# Species (combined-orbit) BFS reduction — the deep soundness check: the reduced
+# graph must equal a direct build, and the certificate must engage/decline exactly
+# when the algorithm is/ isn't species-equivariant at the leaf level.
+@testset "species BFS reduction: graph == direct build, and engages correctly" begin
+    run(path) = (Base.include(Main, path);
+        Base.invokelatest(() -> _species_graph_consistency(Main.NGRID, Main.PARTICLE_TYPES,
+                                                           Main.algorithm, Main.energy)))
+    # (name, expected species_free) — covers: distinct-S3, S3 swap, big-tree S3,
+    # S2, repeated-multiplicity S2, S2 broken-but-equivariant; and the three DECLINE
+    # paths (type tie-break, absolute-type branch, raw-label covariance).
+    cases = [("single_metropolis", true), ("kawasaki", true), ("vmmc_2d_shuffle", true),
+             ("metropolis_4x4", true), ("hop_repeated_species", true),
+             ("broken_variable_pool", true),
+             ("vmmc_2d", false), ("broken_species_halfbeta", false),
+             ("swap_literal_species", false)]
+    @testset "$(name)" for (name, exp_species) in cases
+        geq, dbeq, sfree, nbfs_on, nbfs_off = run(joinpath(@__DIR__, "examples", name * ".jl"))
+        @test geq                       # reduced graph == direct graph (random coupling points)
+        @test dbeq                      # same DB verdict either way
+        @test sfree == exp_species      # certificate engaged iff species-equivariant
+        if sfree
+            @test nbfs_on < nbfs_off    # the reduction actually BFS'd fewer states
+        end
+    end
+
+    # ROBUSTNESS: a label operation that is not overloaded on TypeTag (here `÷`)
+    # makes the tagged probe MethodError. That must NOT crash the run — it must be
+    # caught, species declined, and the verdict computed correctly via the fallback.
+    n = 3; energy = mk_energy(n, 2); states = enumerate_states([1,2,3], n)
+    weird = (rng, st::PState) -> begin
+        pidx = rand_choice_index!(rng, length(st)); p = st[pidx]
+        _ = p.t ÷ 2                                   # un-overloaded op on a label
+        (dr, dc) = rand_choice!(rng, DISPS8); np = Particle(p.r+dr, p.c+dc, p.t)
+        rest = st[setdiff(1:length(st), pidx)]
+        for q in rest; same_site(q, np, n) && return st; end
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        metropolis!(rng, dE) ? ns : st
+    end
+    local bfs
+    @test (bfs = build_transitions(weird, energy, states, n, 30)) isa BFSResult   # no crash
+    @test bfs.species_free == false                                               # declined
+    p_on, _, _  = run_db_check(build_dbmodel(bfs, energy))
+    p_off, _, _ = run_db_check(build_dbmodel(build_transitions(weird, energy, states, n, 30; species=false), energy))
+    @test p_on == p_off                                                           # correct via fallback
 end
 
 end

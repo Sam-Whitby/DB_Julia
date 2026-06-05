@@ -86,6 +86,9 @@ function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
     println("  Translational : ", bfs.tau_free ? "PASS  — tau cancels in all leaf weights" :
             "FAIL  — " * bfs.tau_msg)
     bfs.tau_free || println("  (DB still checked directly from every state; orbit reduction not assumed.)")
+    @printf("  States BFS'd  : %d of %d  (%s)\n", bfs.nbfs, length(states),
+            bfs.species_free ? "translation + species reduction (graph-certified)" :
+            bfs.tau_free ? "translation reduction" : "all states (no equivariance)")
 
     println(SEP2); println("  Step 3: Ergodicity (reachability from seed)"); println(SEP2)
     t3 = @elapsed erg = check_ergodicity(bfs, seed)

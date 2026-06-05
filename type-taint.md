@@ -9,14 +9,27 @@ over species (type-permutation) orbits as well as translation orbits. Because th
 All experiments are in [`doc/typetaint_poc.jl`](typetaint_poc.jl) (self-contained,
 `julia doc/typetaint_poc.jl`). The findings below quote its output verbatim.
 
-**TL;DR recommendation: do not adopt the type-taint BFS reduction.** The idea is
-sound *in principle* and the tag works and stays deterministic, but (1) it does not
-help the actual bottleneck (VMMC), (2) its soundness rests on a no-unwrap
-discipline that is far harder to guarantee for species labels than for positions
-(they are pervasively used as raw `Int`s), and (3) the species symmetry it targets
-is already captured *safely and post-hoc* by the Step-4 graph-verified reduction
-(shipped) with **zero** API change and **zero** unwrap risk. Keep the idea on the
-shelf for type-rich *large* systems, and even then prefer the safe alternatives in §6.
+> **UPDATE — now IMPLEMENTED (supersedes the original recommendation below).** The
+> original analysis judged the idea on `vmmc_2d` (which *declines* species — its
+> sort tie-breaks on the type label) and concluded "do not adopt." Building
+> `vmmc_2d_shuffle` — VMMC with a *random* candidate order, which is typical of real
+> MC codes — produced a species-equivariant algorithm with a large tree whose τ-BFS
+> the certificate cuts ~4–5× (56→12 reps, warm ≈6.3 s → ≈2.5 s). That tipped the
+> cost/benefit, so the type-taint BFS reduction was implemented with τ-level rigor
+> (parametric `Particle`, the `TypeTag` tag, a species-covariance guard, fail-loud
+> fallback) and is validated to reproduce the direct-build graph exactly (AUDIT
+> §5.13). The original §1–§7 below are kept as the design record; the soundness
+> concerns they raise are addressed by the covariance guard, the fail-loud probe,
+> and the graph-equality test rather than dismissed.
+
+**Original TL;DR (pre-implementation): do not adopt the type-taint BFS reduction.**
+The idea is sound *in principle* and the tag works and stays deterministic, but (1)
+it does not help the actual bottleneck (VMMC *as then written*), (2) its soundness
+rests on a no-unwrap discipline that is harder to guarantee for species labels than
+for positions, and (3) the species symmetry it targets is already captured safely
+and post-hoc by the Step-4 graph-verified reduction. *(Resolution: point 1 was
+specific to the sorted VMMC; the typical randomised-order variant does benefit, and
+points 2–3 are handled by the covariance guard + graph-equality validation.)*
 
 ---
 

@@ -387,3 +387,43 @@ verdict on every example, plus a focused test that `[1,2,3]` yields S₃, `[1,1,
 yields nothing, and a species-dependent algorithm ("only species 1 moves") yields
 exactly the spectator subgroup `type(2<->3)` but not `type(1<->2)` — the checker
 discovers the true partial symmetry and never over-reduces. 185 tests pass.
+
+### 5.13 Species-equivariance certificate: reducing the tau-BFS (type-taint, implemented)
+
+The `type-taint.md` investigation originally recommended NOT building a species
+certificate for the BFS, because the only bundled bottleneck (vmmc_2d) declines it.
+That changed once `vmmc_2d_shuffle` — VMMC with a random candidate order instead of
+a type-dependent sort, which is *typical* of real Monte-Carlo codes — was shown to
+be species-equivariant with a large tree. For that class the certificate cuts the
+tau-BFS (the bottleneck) ~4-5x (56->12 representatives; warm ~6.3 s -> ~2.5 s), so it
+was implemented with tau-level rigor.
+
+Design: `Particle` became parametric in the label type, so the fast path uses plain
+Int labels and only the species PROBE uses a `TypeTag` (the discrete analogue of
+`TauNum`). During a single tagged BFS the tag permits only equivariant label uses
+(equality, hashing, `Jc`) and FLAGS absolute uses (compare-to-constant, ordering,
+arithmetic, coercion); a species-COVARIANCE guard additionally requires every output
+label to be an inherited tag, not a fresh literal. An unflagged, covariant, tau-free
+probe certifies species-equivariance, and the BFS is run over the combined
+(translation x species) orbits, deriving the rest by translating AND atom-relabeling
+representative leaves. Any flag (e.g. vmmc_2d's type tie-break) or a non-CantHandle
+error in the probe causes a sound fall-back to the translation-only / all-states
+path (the probe is wrapped so an un-overloaded label op declines rather than crashes).
+
+Containment of the soundness surface the report flagged:
+- the unwrap hole ("read the raw label and branch on it") is the only silent gap and
+  is the same discipline as tau's `tau0`; writing a raw label back out is caught by
+  the species-covariance guard; numeric coercions are intercepted or fail loud;
+- the derivation is checked, not trusted: the suite verifies the species-reduced
+  transition graph is IDENTICAL to a direct (species-off) build by comparing the two
+  graphs' transition probabilities at random coupling points (`species=false` kwarg),
+  in addition to the exact reduced-vs-all-pairs DB-verdict checks. The combined-orbit
+  reps are a SUBSET of the translation reps, so a declined probe reuses their leaves
+  with no wasted BFS, and vmmc_2d does not regress.
+
+New examples cover the cases: `vmmc_2d_shuffle` (species-equivariant VMMC, the win),
+`hop_repeated_species` ([1,1,2,2] repeated-multiplicity S2), `broken_species_halfbeta`
+(species-dependent acceptance -> declined, DB-FAIL still caught), `swap_literal_species`
+(raw-label output -> covariance guard declines, DB still correct), plus a robustness
+test that an un-overloaded label op declines instead of crashing. 249 tests pass
+(serial and `-t auto`).
