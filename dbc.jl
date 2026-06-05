@@ -390,6 +390,21 @@ const _TAU     = [false]
 const _TAU_MSG = [""]
 tau_violation!(msg::String) = (i = Threads.threadid(); _TAU[i] = true; _TAU_MSG[i] = msg; nothing)
 
+# --- OIP (order-independent iteration) controls --------------------------------
+# `unordered(rng, items)` lets an algorithm declare an order-independent candidate
+# loop: it yields a canonical order that reads NONE of the items' content (so it
+# cannot itself break a species / point-group symmetry the way a sort tie-breaking
+# on a label would) and consumes NO random bits (so it does not blow up the
+# decision tree the way an explicit shuffle does). `_OIP_ORDER` selects which order
+# to yield (1 = as given; 2 = reversed; 3 = cyclic shift), so the engine can re-BFS
+# the representative in a second/third order and VERIFY the leaves are identical —
+# the OIP cross-check that makes single-order execution sound (build_transitions).
+# `_OIP_USED` (thread-local) records whether the algorithm called it this run.
+const _OIP_ORDER = Ref(1)
+const _OIP_USED  = [false]
+_oip_clear!() = (for i in eachindex(_OIP_USED); _OIP_USED[i] = false; end; _OIP_ORDER[] = 1)
+_oip_used()   = any(_OIP_USED)
+
 # Resize the thread-local scratch (tau flags + interning caches) to the active
 # thread count and clear it. Call once at the start of each run.
 # Sized by maxthreadid() (not nthreads()): with `julia -t auto` the interactive
@@ -402,6 +417,7 @@ function _init_threadlocal!()
     resize!(_SP_MSG, nt);       fill!(_SP_MSG, "")
     resize!(_ROT_BAD, nt);      fill!(_ROT_BAD, false)
     resize!(_ROT_MSG, nt);      fill!(_ROT_MSG, "")
+    resize!(_OIP_USED, nt);     fill!(_OIP_USED, false); _OIP_ORDER[] = 1
     resize!(_TH_CACHES, nt)
     for i in 1:nt; _TH_CACHES[i] = Dict{Any,ThExpr}(); end
     nothing
@@ -645,6 +661,25 @@ function rand_integer!(rng::BitSeqRNG, lo::Int, hi::Int)::Int
     val >= n && throw(OutOfRangeException())
     rng.coeff *= Q(2)^k // n
     lo + val
+end
+
+# Order-independent iteration (the OIP contract). Yields `items` in a canonical
+# order that reads NONE of their content, so it cannot itself break a species /
+# point-group symmetry (unlike a sort tie-breaking on a label), and consumes NO
+# random bits, so it does NOT blow up the decision tree the way an explicit shuffle
+# (Fisher-Yates over the rng) does. The author asserts the loop body's effect is
+# INDEPENDENT of the visitation order; build_transitions VERIFIES this per run by
+# re-BFSing the representative in a second/third order and asserting an identical
+# leaf multiset (the OIP cross-check) — a mismatch is a hard error. `rng` is taken
+# for call-site symmetry with the other primitives but is not consumed. Returns a
+# fresh Vector (the caller may iterate or mutate it).
+function unordered(rng, items::AbstractVector)
+    i = Threads.threadid(); (i <= length(_OIP_USED)) && (_OIP_USED[i] = true)
+    v = collect(items)
+    ord = _OIP_ORDER[]
+    ord == 1 && return v
+    ord == 2 && return reverse(v)
+    length(v) <= 1 ? v : vcat(v[2:end], v[1:1])        # ord == 3: cyclic shift by 1
 end
 
 # General acceptance test: mirrors  RandomReal[] < thr  for an arbitrary symbolic
@@ -1037,6 +1072,89 @@ function _unwrap_cant(e)
     e
 end
 
+# ---- OIP cross-check: verify order-independence of the TRANSITION distribution --
+# A leaf weight is order-independent as a PRODUCT, but an algorithm with an
+# early-abort (e.g. VMMC's frustration → reject) decomposes the rejection
+# probability into DIFFERENT partial-product leaves per order, whose individual
+# weights differ while their SUM (the true T(s→t)) does not. So we compare the
+# per-successor SUMMED transition probability, not the raw leaf multiset.
+#
+# The comparison is by float evaluation at several DETERMINISTIC coupling points
+# and betas — the identical random-coupling-point methodology the test suite uses to
+# validate the species / point-group graph reductions (`_species_graph_consistency`,
+# `_pg_graph_consistency`), here as a per-run guard. It is deterministic (the points
+# are a fixed function of the atom index, no RNG), and it only gates a SPEED feature:
+# the suite additionally pins each shipped `unordered` example to an exact direct
+# all-states build. A mismatch is a hard error (the body is order-dependent).
+function _oip_points(atoms::Vector{Atom})
+    pts = Dict{Atom,Float64}[]
+    for m in 1:6
+        J = Dict{Atom,Float64}()
+        for (k, a) in enumerate(atoms); J[a] = cos(1.0k + 2.3m) * (0.5 + 0.4 * sin(0.7k - 1.1m)); end
+        push!(pts, J)
+    end
+    pts
+end
+function _oip_tvec(leaves::Vector{Leaf}, J::Dict{Atom,Float64}, beta::Float64)
+    T = Dict{CState,Float64}()
+    for lf in leaves; T[lf.next] = get(T, lf.next, 0.0) + eval_leaf(lf, J, beta); end
+    T
+end
+function _oip_match(la::Vector{Leaf}, lb::Vector{Leaf})::Bool
+    seen = Set{Atom}(); atoms = Atom[]
+    for lf in Iterators.flatten((la, lb)), f in lf.factors
+        s2 = Set{Atom}(); _collect_atoms_th!(s2, f.thr)
+        for a in s2; (a in seen) || (push!(seen, a); push!(atoms, a)); end
+    end
+    sort!(atoms)
+    for J in _oip_points(atoms), beta in (0.6, 1.0, 1.5)
+        Ta = _oip_tvec(la, J, beta); Tb = _oip_tvec(lb, J, beta)
+        for k in union(keys(Ta), keys(Tb))
+            a = get(Ta, k, 0.0); b = get(Tb, k, 0.0)
+            abs(a - b) <= 1e-7 * (1 + abs(a)) || return false
+        end
+    end
+    true
+end
+
+# BFS `seeds` in canonical order; if the algorithm used `unordered`, ALSO BFS in a
+# reversed and a cyclically-shifted order and assert each seed's leaf multiset is
+# identical (the exact OIP cross-check). A mismatch means the loop body is NOT
+# order-independent, so `unordered` was misused — a hard error (the single-order
+# leaves would be a different algorithm than intended). The alt passes use plain Int
+# seeds with the rotation probe OFF and restore the species/rotation flags, so they
+# are purely a leaf comparison and never perturb the symmetry certificates. Returns
+# the canonical-order leaves.
+function _bfs_seeds_oip(algo, seeds::Vector{CState}, n::Int, maxdepth::Int, parallel::Bool;
+                       seedfn = augmented_pstate)
+    _OIP_ORDER[] = 1
+    base = _bfs_seeds(algo, seeds, n, maxdepth, parallel; seedfn = seedfn)
+    if _oip_used()
+        sp = copy(_SPECIES_BAD); spm = copy(_SP_MSG)
+        ro = copy(_ROT_BAD);     rom = copy(_ROT_MSG); rp = _ROT_PROBE[]
+        _ROT_PROBE[] = false
+        # One reversed order: with the candidate list reversed, two genuinely
+        # order-dependent prefixes differ, while an order-independent body's summed
+        # per-successor probabilities are unchanged. (A reversal already exercises
+        # the cyclic-shift order on >2 candidates; order 3 is available for a
+        # stronger check if ever needed.)
+        _OIP_ORDER[] = 2
+        alt = _bfs_seeds(algo, seeds, n, maxdepth, parallel; seedfn = augmented_pstate)
+        for i in eachindex(seeds)
+            _oip_match(base[i], alt[i]) || begin
+                _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
+                cant("unordered(): the result depends on the candidate visitation order " *
+                     "(transition probabilities differ between two orders) — `unordered` requires " *
+                     "the loop body's effect to be independent of order")
+            end
+        end
+        _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
+        copyto!(_SPECIES_BAD, sp); copyto!(_SP_MSG, spm)
+        copyto!(_ROT_BAD, ro);     copyto!(_ROT_MSG, rom)
+    end
+    base
+end
+
 function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdepth::Int;
                            parallel::Bool=false, species::Bool=true,
                            moves::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing,
@@ -1102,7 +1220,7 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
         _ROT_PROBE[] = length(Hidx) > 1
         probe_ok = true
         try
-            vec = _bfs_seeds(algo, creps0, n, maxdepth, parallel; seedfn = seedfn)
+            vec = _bfs_seeds_oip(algo, creps0, n, maxdepth, parallel; seedfn = seedfn)
             for i in eachindex(creps0); rep_leaves[creps0[i]] = vec[i]; end
         catch e
             (e isa CantHandle) && rethrow(e)
@@ -1118,7 +1236,7 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
             creps, cr_of, kg_of = combined_trep_orbits_pg(treps, repof, σg, Hi, n)
             need = CState[cr for cr in creps if !haskey(rep_leaves, cr)]
             if !isempty(need)
-                extra = _bfs_seeds(algo, need, n, maxdepth, parallel)   # Int seeds, no probe
+                extra = _bfs_seeds_oip(algo, need, n, maxdepth, parallel)   # Int seeds, no probe
                 for i in eachindex(need); rep_leaves[need[i]] = extra[i]; end
             end
             derive!(creps, cr_of, kg_of, σg)
@@ -1130,7 +1248,7 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
 
     # --- translation-only reduction / all-states fallback -----------------------
     need = CState[tr for tr in treps if !haskey(rep_leaves, tr)]
-    extra = _bfs_seeds(algo, need, n, maxdepth, parallel)
+    extra = _bfs_seeds_oip(algo, need, n, maxdepth, parallel)
     for i in eachindex(need); rep_leaves[need[i]] = extra[i]; end
     tau_free = !_tau_any(); tau_msg = _tau_first_msg()
 
@@ -1149,7 +1267,7 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
 
     # Not translation invariant: direct BFS from EVERY state (no equivariance).
     moreneed = CState[s for s in states if !haskey(rep_leaves, s)]
-    moreextra = _bfs_seeds(algo, moreneed, n, maxdepth, parallel)
+    moreextra = _bfs_seeds_oip(algo, moreneed, n, maxdepth, parallel)
     for i in eachindex(moreneed); rep_leaves[moreneed[i]] = moreextra[i]; end
     for (s, si) in idx
         for lf in rep_leaves[s]

@@ -69,6 +69,22 @@ end
 #   rand_integer!(rng, lo, hi)   uniform integer in [lo,hi]      (weight 1/(hi-lo+1))
 #   metropolis!(rng, dE)         accept with min(1, exp(-beta*dE)); dE::LinForm
 #   accept!(rng, thr)            accept with a custom symbolic threshold thr
+#   unordered(rng, list)         iterate `list` in an order-independent way (OIP)
+#
+# THE ORDER-INDEPENDENT PRIMITIVE (`unordered`)
+# ---------------------------------------------
+# If your move processes a set of candidates in a loop whose RESULT does not depend
+# on the visiting order (e.g. a cluster builder where each candidate's link decision
+# is independent), write `for q in unordered(rng, cands)`. Two reasons:
+#   * it reads NONE of the items' content, so it cannot break a species / point-group
+#     symmetry the way a sort tie-breaking on `state[qi].t` would (that tie-break is
+#     exactly why vmmc_2d.jl declines species);
+#   * it consumes NO random bits, so it does NOT blow up the decision tree the way an
+#     explicit Fisher-Yates shuffle does (which adds a factor of |cands|! per step).
+# You are ASSERTING order-independence; the checker VERIFIES it (it re-BFSes each
+# representative in a second candidate order and checks the transition probabilities
+# are identical) and raises a HARD ERROR if your body actually depends on order.
+# See examples/vmmc_2d_unordered.jl.
 #
 # For custom thresholds (cluster algorithms etc.) build `thr` with th_const,
 # th_boltz, th_sub, th_div, th_min, th_max, th_piece, c_lt, c_le — see vmmc_2d.jl.
