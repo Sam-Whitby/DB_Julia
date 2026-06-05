@@ -14,8 +14,29 @@
 #       julia --project=. -t auto test_db.jl  (also exercises the parallel path)
 # ============================================================================
 
+_pre_dbc = Set(names(Main; all=true))
 include(joinpath(@__DIR__, "dbc.jl"))
+# Names dbc.jl added to Main — injected into each example's fresh module below.
+const _DBC_NAMES = setdiff(names(Main; all=true), _pre_dbc)
 using Test, Random
+
+# Load an example into a FRESH module so its `const NGRID` / `PARTICLE_TYPES` /
+# `MOVES` never collide or go stale across includes (redefining a `const` global in
+# Main is unreliable across many includes — it silently kept a previous example's
+# value, e.g. running quadratic_field's 2-particle/2x2 case on a stale 3-particle/3x3
+# state). The fresh module gets Base (default) plus every dbc binding by value, so
+# the example's `pbc_d2`, `Jc`, `move`, `Particle`, … all resolve.
+function load_example(path)
+    m = Module(gensym("Ex"))
+    for nm in _DBC_NAMES
+        s = string(nm)
+        (startswith(s, "#") || startswith(s, "@")) && continue
+        isdefined(Main, nm) || continue
+        try; Core.eval(m, :($nm = $(getfield(Main, nm)))); catch; end
+    end
+    Base.include(m, path)
+    m
+end
 
 seed_state(types, n) = (st = sort(types); pos = [(r,c) for r in 1:n for c in 1:n];
     sort(NTuple{3,Int}[(pos[k][1], pos[k][2], st[k]) for k in 1:length(st)]))
@@ -195,9 +216,9 @@ EXPECT = [
     ("swap_literal_species",        (true,  true,  false)),   # raw-label write -> covariance guard declines
 ]
 
-function _run_pipeline(n, types, algo, energy)
+function _run_pipeline(n, types, algo, energy; moves=nothing)
     states = enumerate_states(types, n)
-    bfs = build_transitions(algo, energy, states, n, 30)
+    bfs = build_transitions(algo, energy, states, n, 30; moves=moves)
     erg = check_ergodicity(bfs, seed_state(types, n))
     m = build_dbmodel(bfs, energy)
     pass_r, _, ch_r = run_db_check(m; use_symmetry=true)            # graph-symmetry reduced
@@ -206,7 +227,7 @@ function _run_pipeline(n, types, algo, energy)
     (tau=bfs.tau_free, db=pass_r, erg=erg.ergodic, count=cnt,
      db_full=pass_f, ch_eq=(ch_r == ch_f), sym=m.sym_names,
      npairs=length(m.pairs), nreps=length(m.check_pairs),
-     species_free=bfs.species_free, nbfs=bfs.nbfs)
+     species_free=bfs.species_free, nbfs=bfs.nbfs, pg_idx=bfs.pg_idx)
 end
 
 # The species (combined-orbit) BFS reduction must produce EXACTLY the same
@@ -215,10 +236,13 @@ end
 # transition probabilities at random coupling points — an independent check of the
 # species-relabel + atom-permute expansion. Returns (graphs_equal, db_equal,
 # species_free_on, nbfs_on, nbfs_off).
-function _species_graph_consistency(n, types, algo, energy)
+function _species_graph_consistency(n, types, algo, energy; moves=nothing)
     states = enumerate_states(types, n)
-    bon  = build_transitions(algo, energy, states, n, 30; species=true)
-    boff = build_transitions(algo, energy, states, n, 30; species=false)
+    # Isolate the SPECIES reduction (point group off on both sides) so this checks the
+    # species-relabel + atom-permute expansion specifically. `moves` is still passed
+    # so rand_move!/move work for contract examples; use_pointgroup=false keeps H={id}.
+    bon  = build_transitions(algo, energy, states, n, 30; species=true,  moves=moves, use_pointgroup=false)
+    boff = build_transitions(algo, energy, states, n, 30; species=false, moves=moves, use_pointgroup=false)
     atoms = Set{Atom}()
     for b in (bon, boff), lf in b.uweights, f in lf.factors; _collect_atoms_th!(atoms, f.thr); end
     tmat(b, J) = (T = Dict{Tuple{Int,Int},Float64}();
@@ -235,13 +259,54 @@ function _species_graph_consistency(n, types, algo, energy)
     db_off, _, _ = run_db_check(build_dbmodel(boff, energy))
     (geq, db_on == db_off, bon.species_free, bon.nbfs, boff.nbfs)
 end
+
+# Point-group (translation × species × p4m) BFS reduction — soundness check: the
+# fully-reduced graph must equal an INDEPENDENT baseline at random coupling points.
+# The baseline is the translation-only build (species & point-group OFF), which BFSes
+# every translation rep separately and derives by PURE translation — a different
+# derivation path from translate∘rotate∘relabel, and itself anchored to a direct
+# all-states BFS by the species test. With `direct=true` the baseline is instead a
+# full direct all-states BFS (no derivation at all) — the gold standard, used on the
+# small example. Returns (graph_equal, db_pass, pg_idx, nbfs_reduced, nstates).
+function _pg_graph_consistency(n, types, algo, energy; moves, direct::Bool=false)
+    states = enumerate_states(types, n); ix = Dict(s => i for (i, s) in enumerate(states))
+    bon = build_transitions(algo, energy, states, n, 30; species=true, moves=moves, use_pointgroup=true)
+    atoms = Set{Atom}(); for lf in bon.uweights, f in lf.factors; _collect_atoms_th!(atoms, f.thr); end
+    tmat_on(J) = (T = Dict{Tuple{Int,Int},Float64}();
+                  for (s,d,wi) in bon.trans; T[(s,d)] = get(T,(s,d),0.0) + eval_leaf(bon.uweights[wi], J, 1.0); end; T)
+    if direct                                   # gold standard: BFS every state, no derivation
+        _MOVESET[] = moves === nothing ? Tuple{Int,Int}[] : moves; _ROT_PROBE[] = false; _init_threadlocal!()
+        base = Vector{Vector{Leaf}}(undef, length(states))
+        for (i, s) in enumerate(states); base[i] = build_state_leaves(algo, augmented_pstate(s), n, 30); end
+        for lvs in base, lf in lvs, f in lf.factors; _collect_atoms_th!(atoms, f.thr); end
+        tmat_base(J) = (T = Dict{Tuple{Int,Int},Float64}();
+                        for (i,lvs) in enumerate(base), lf in lvs; d = ix[lf.next];
+                            d != i && (T[(i,d)] = get(T,(i,d),0.0) + eval_leaf(lf, J, 1.0)); end; T)
+        cmp = tmat_base
+    else                                        # cheap baseline: translation-only build
+        btr = build_transitions(algo, energy, states, n, 30; species=false, moves=moves, use_pointgroup=false)
+        for lf in btr.uweights, f in lf.factors; _collect_atoms_th!(atoms, f.thr); end
+        tmat_tr(J) = (T = Dict{Tuple{Int,Int},Float64}();
+                      for (s,d,wi) in btr.trans; T[(s,d)] = get(T,(s,d),0.0) + eval_leaf(btr.uweights[wi], J, 1.0); end; T)
+        cmp = tmat_tr
+    end
+    geq = true; Random.seed!(999)
+    for _ in 1:4
+        J = Dict{Atom,Float64}(a => rand()*2 - 1 for a in atoms)
+        T1 = tmat_on(J); T2 = cmp(J)
+        for k in union(keys(T1), keys(T2)); abs(get(T1,k,0.0) - get(T2,k,0.0)) < 1e-7 || (geq = false); end
+    end
+    dbon, _, _ = run_db_check(build_dbmodel(bon, energy))
+    (geq, dbon, bon.pg_idx, bon.nbfs, length(states))
+end
+
 function run_example(path)
-    Base.include(Main, path)                         # (re)defines NGRID/energy/algorithm
-    # invokelatest: the bindings just (re)defined by include() are newer than this
-    # function's world age, so both reading them and calling them must happen in
-    # the latest world — do it all inside the invokelatest closure.
+    m = load_example(path)
+    # invokelatest: m's functions are newer than this function's world age, so both
+    # reading and calling them must happen in the latest world.
     Base.invokelatest() do
-        _run_pipeline(Main.NGRID, Main.PARTICLE_TYPES, Main.algorithm, Main.energy)
+        moves = isdefined(m, :MOVES) ? Vector{Tuple{Int,Int}}(m.MOVES) : nothing
+        _run_pipeline(m.NGRID, m.PARTICLE_TYPES, m.algorithm, m.energy; moves=moves)
     end
 end
 
@@ -416,9 +481,10 @@ end
 # graph must equal a direct build, and the certificate must engage/decline exactly
 # when the algorithm is/ isn't species-equivariant at the leaf level.
 @testset "species BFS reduction: graph == direct build, and engages correctly" begin
-    run(path) = (Base.include(Main, path);
-        Base.invokelatest(() -> _species_graph_consistency(Main.NGRID, Main.PARTICLE_TYPES,
-                                                           Main.algorithm, Main.energy)))
+    run(path) = (m = load_example(path);
+        Base.invokelatest(() -> _species_graph_consistency(m.NGRID, m.PARTICLE_TYPES,
+            m.algorithm, m.energy;
+            moves = isdefined(m, :MOVES) ? Vector{Tuple{Int,Int}}(m.MOVES) : nothing)))
     # (name, expected species_free) — covers: distinct-S3, S3 swap, big-tree S3,
     # S2, repeated-multiplicity S2, S2 broken-but-equivariant; and the three DECLINE
     # paths (type tie-break, absolute-type branch, raw-label covariance).
@@ -456,6 +522,57 @@ end
     p_on, _, _  = run_db_check(build_dbmodel(bfs, energy))
     p_off, _, _ = run_db_check(build_dbmodel(build_transitions(weird, energy, states, n, 30; species=false), energy))
     @test p_on == p_off                                                           # correct via fallback
+end
+
+# Point-group (p4m) BFS reduction — the gold-standard soundness + correct-subgroup
+# + decline tests. The fully-reduced graph (translation × species × point-group)
+# must equal a DIRECT all-states BFS, the discovered subgroup must be exactly right,
+# and an algorithm that bypasses the supplied-direction contract must DECLINE the
+# point group (never a silent wrong reduction) while keeping the correct verdict.
+@testset "point-group BFS reduction: graph == direct build, correct subgroup, declines safely" begin
+    D4 = Set(["identity","rotate90","rotate180","rotate270","reflect","reflect_h","reflect_v","reflect_ad"])
+    D2 = Set(["identity","rotate180","reflect_h","reflect_v"])
+    runpg(path; direct=false) = (m = load_example(path);
+        Base.invokelatest(() -> _pg_graph_consistency(m.NGRID, m.PARTICLE_TYPES,
+            m.algorithm, m.energy; moves = Vector{Tuple{Int,Int}}(m.MOVES), direct=direct)))
+    # direct=true (gold-standard direct all-states baseline) only for the small example
+    # (horizontal, 72 states) to keep the suite fast; the rest use the cheap, equally
+    # sound translation-only baseline.
+    cases = [("single_metropolis", D4, false), ("metropolis_4x4", D4, false),
+             ("hop_8way_correct", D4, false), ("horizontal_metropolis", D2, true),
+             ("vmmc_2d_shuffle", D4, false),  # species + D4
+             ("vmmc_2d", D4, false),          # D4 only (sort tie-breaks species)
+             ("kawasaki", D4, false)]         # empty move set -> vacuous D4, + species
+    @testset "$(name)" for (name, expset, direct) in cases
+        geq, db, pgidx, nbfs, nstates = runpg(joinpath(@__DIR__, "examples", name * ".jl"); direct=direct)
+        @test geq                                  # full reduced graph == independent baseline
+        @test Set(pt_name.(pgidx)) == expset       # exactly the right point-group subgroup
+        @test nbfs < nstates                       # actually fewer BFS
+    end
+
+    # DECLINE: an algorithm that bypasses rand_move! (hardcoded direction / bare
+    # position arithmetic) must trip the rotation probe -> point group DECLINED
+    # (pg_idx empty), with the DB verdict unchanged from a point-group-off build.
+    n = 3; energy = mk_energy(n, 2); states = enumerate_states([1,2,3], n)
+    hard = (rng, st::PState) -> begin
+        pidx = rand_choice_index!(rng, length(st)); p = st[pidx]
+        np = move(p, (1, 0))                        # hardcoded tuple: NOT from rand_move!
+        rest = st[setdiff(1:length(st), pidx)]
+        for q in rest; same_site(q, np, n) && return st; end
+        ns = vcat(rest, [np]); dE = linsub(energy(ns), energy(st))
+        metropolis!(rng, dE) ? ns : st
+    end
+    bh   = build_transitions(hard, energy, states, n, 30; moves=DISPS8, use_pointgroup=true)
+    bhno = build_transitions(hard, energy, states, n, 30; moves=DISPS8, use_pointgroup=false)
+    @test isempty(bh.pg_idx)                                          # point group declined
+    @test run_db_check(build_dbmodel(bh,   energy))[1] ==
+          run_db_check(build_dbmodel(bhno, energy))[1]                # verdict unaffected
+
+    # A non-closed direction set yields only the subgroup it IS closed under.
+    @test Set(pt_name.(pointgroup_subgroup([(0,1),(0,-1)]))) == D2    # column moves -> D2
+    @test Set(pt_name.(pointgroup_subgroup(DISPS8)))         == D4    # king moves   -> D4
+    @test pointgroup_subgroup([(1,0)]) ⊆ collect(1:8) &&
+          "rotate90" ∉ pt_name.(pointgroup_subgroup([(1,0)]))        # single dir: no rotate90
 end
 
 end

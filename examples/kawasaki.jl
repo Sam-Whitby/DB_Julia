@@ -14,6 +14,11 @@ const NGRID          = 3
 const MAXD2          = 2
 const PARTICLE_TYPES = [1, 2, 3]
 
+# No position moves (types swap at fixed sites), so the move set is empty and
+# VACUOUSLY closed under all of D4 — the checker certifies the full point group on
+# top of the species symmetry. Declaring MOVES opts this example into that reduction.
+const MOVES = NTuple{2,Int}[]
+
 function energy(state::PState)::LinForm
     lf = LinForm()
     for i in 1:length(state), j in (i+1):length(state)

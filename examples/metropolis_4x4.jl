@@ -13,7 +13,7 @@ const NGRID          = 4
 const MAXD2          = 4
 const PARTICLE_TYPES = [1, 2]
 
-const M4_DISPS = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]
+const MOVES = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]   # D4-closed
 
 function energy(state::PState)::LinForm
     lf = LinForm()
@@ -28,8 +28,7 @@ end
 function algorithm(rng, state::PState)::PState
     pidx = rand_choice_index!(rng, length(state))
     p    = state[pidx]
-    (dr, dc) = rand_choice!(rng, M4_DISPS)
-    newp = Particle(p.r + dr, p.c + dc, p.t)
+    newp = move(p, rand_move!(rng))
     rest = state[setdiff(1:length(state), pidx)]
     for q in rest
         same_site(q, newp, NGRID) && return state

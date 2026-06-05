@@ -31,7 +31,10 @@ const MAXD2          = 2
 const PARTICLE_TYPES = [1, 2]
 
 # Only horizontal (column) moves. (0,+1) = move right; (0,−1) = move left.
-const HM_DISPS = [(0, 1), (0, -1)]
+# This set is closed under D2 = {identity, rotate180, reflect_h, reflect_v} but NOT
+# under rotate90 (which maps a column move to a row move, outside the set), so the
+# point-group reduction discovers exactly D2 — see the header note above.
+const MOVES = [(0, 1), (0, -1)]
 
 function energy(state::PState)::LinForm
     lf = LinForm()
@@ -46,8 +49,7 @@ end
 function algorithm(rng, state::PState)::PState
     pidx = rand_choice_index!(rng, length(state))
     p    = state[pidx]
-    (dr, dc) = rand_choice!(rng, HM_DISPS)              # only column changes
-    newp = Particle(p.r + dr, p.c + dc, p.t)
+    newp = move(p, rand_move!(rng))                     # only column changes
     rest = state[setdiff(1:length(state), pidx)]
     for q in rest
         same_site(q, newp, NGRID) && return state

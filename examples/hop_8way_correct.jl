@@ -21,15 +21,14 @@ const NGRID          = 4
 const MAXD2          = 0              # zero energy: pi uniform
 const PARTICLE_TYPES = [1, 2]
 
-const H8_DISPS = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]
+const MOVES = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]   # D4-closed
 
 energy(state::PState)::LinForm = LinForm()
 
 function algorithm(rng, state::PState)::PState
     pidx = rand_choice_index!(rng, length(state))
     p    = state[pidx]
-    (dr, dc) = rand_choice!(rng, H8_DISPS)              # ALWAYS 8 (no variable pool)
-    newp = Particle(p.r + dr, p.c + dc, p.t)
+    newp = move(p, rand_move!(rng))                     # ALWAYS 8 (no variable pool)
     rest = state[setdiff(1:length(state), pidx)]
     for q in rest
         same_site(q, newp, NGRID) && return state       # occupied -> stay (symmetric)

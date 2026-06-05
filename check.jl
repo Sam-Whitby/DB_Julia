@@ -74,9 +74,10 @@ function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
             "  (found ", length(states), ", theoretical ", theo, ")")
 
     println(SEP2); println("  Step 2: tau-BFS (translational invariance + path enumeration)"); println(SEP2)
+    moves = isdefined(Main, :MOVES) ? Vector{Tuple{Int,Int}}(Main.MOVES) : nothing
     local bfs
     try
-        t2 = @elapsed (bfs = build_transitions(algo, energy, states, n, maxdepth; parallel=parallel))
+        t2 = @elapsed (bfs = build_transitions(algo, energy, states, n, maxdepth; parallel=parallel, moves=moves))
         @printf("  BFS done  (%.2fs)\n", t2)
     catch e
         e isa CantHandle ? (println("  ERROR: ", e.msg); exit(1)) :
@@ -86,9 +87,13 @@ function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
     println("  Translational : ", bfs.tau_free ? "PASS  — tau cancels in all leaf weights" :
             "FAIL  — " * bfs.tau_msg)
     bfs.tau_free || println("  (DB still checked directly from every state; orbit reduction not assumed.)")
+    redparts = String[]
+    bfs.tau_free && push!(redparts, "translation")
+    bfs.species_free && push!(redparts, "species")
+    isempty(bfs.pg_idx) || push!(redparts, "point group {" * join(pt_name.(bfs.pg_idx), ", ") * "}")
     @printf("  States BFS'd  : %d of %d  (%s)\n", bfs.nbfs, length(states),
-            bfs.species_free ? "translation + species reduction (graph-certified)" :
-            bfs.tau_free ? "translation reduction" : "all states (no equivariance)")
+            isempty(redparts) ? "all states (no equivariance)" :
+            join(redparts, " + ") * " reduction (graph-certified)")
 
     println(SEP2); println("  Step 3: Ergodicity (reachability from seed)"); println(SEP2)
     t3 = @elapsed erg = check_ergodicity(bfs, seed)

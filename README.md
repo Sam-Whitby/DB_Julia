@@ -69,6 +69,7 @@ five top-level names:
 const NGRID          = 3
 const MAXD2          = 2              # max squared interaction distance kept
 const PARTICLE_TYPES = [1, 2, 3]      # the species multiset (repeats = identical)
+const MOVES          = [...]          # OPTIONAL: declared displacement set (see below)
 
 energy(state::PState)::LinForm = ...            # symbolic energy, linear in couplings
 algorithm(rng, state::PState)::PState = ...     # one MCMC step using the primitives
@@ -94,6 +95,17 @@ the next state with plain arithmetic — the harness wraps it onto the torus for
 | `th_const, th_boltz, th_linear, th_sub, th_div, th_min, th_max, th_piece, c_lt, c_le` | build symbolic thresholds (for cluster/Barker/rate algorithms) |
 | `pbc_d2(p,q,n)` / `same_site(p,q,n)` / `pmod(x,n)` | min-image distance² / occupancy / `Mod` (all τ-checked) |
 | `Jc(a,b,d2)` / `Xparam(:fieldH)` | a coupling atom `couplingJ[a,b,d2]` (canonical `a≤b`) / a field parameter |
+| `rand_move!(rng)` / `move(p,d)` / `rev(d)` | pick a declared direction / shift covariantly / reverse it (the `MOVES` contract, below) |
+
+**Optional — the `MOVES` contract (point-group reduction).** A move written as
+`p.r + dr` with a *hardcoded* `(dr,dc)` is an absolute constant, so the checker
+cannot certify rotation/reflection equivariance from it. If instead you **declare**
+the displacement set `const MOVES = [...]` and write moves as `move(p, rand_move!(rng))`
+(use `rev(d)` for the reverse displacement), directions become covariant objects the
+point group permutes — and the checker certifies equivariance under the largest
+subgroup of `D4` that `MOVES` is closed under, reducing the τ-BFS over the lattice
+point group too (up to 8× on top of translation × species). This is opt-in: omit
+`MOVES` and everything behaves as before. See [doc/rotation-taint.md](doc/rotation-taint.md).
 
 The threshold algebra handles: `exp(-β·linear)` and Laurent polynomials in such
 exp-monomials; **`th_linear(L)`** — the bare value `⟨L,J⟩`, so weights may carry
@@ -104,12 +116,14 @@ by any binomial denominator including **`1+exp`** (Barker/Glauber) as well as
 
 Translational invariance is **always reported**; it does not by itself fail the
 run (an absolute-field algorithm like `quadratic_field` is correctly τ-FAIL yet
-DB-PASS). Both lattice symmetry (translations + the square point group p4m) **and
-species-permutation symmetry** (relabeling the particle types, which permutes the
-symbolic couplings) are exploited to speed the check — species symmetry reduces both
-the τ-BFS (via a τ-style label tag, §2) and the detailed-balance pair check (§6).
-Both are **verified** (on a single BFS, or on the computed transition graph), so the
-algorithm itself is never trusted, and any subgroup is discovered automatically.
+DB-PASS). Three symmetries are exploited to speed the check: lattice **translation**,
+**species** permutation (relabeling particle types, which permutes the symbolic
+couplings), and — when the `MOVES` contract is used — the lattice **point group**
+(rotations/reflections, `p4m`). All three reduce the τ-BFS (translation via `τ`,
+species via a τ-style label tag, point group via the supplied-direction tag; §2) and
+the detailed-balance pair check (§6). All are **verified** (on a single BFS, or on
+the computed transition graph), so the algorithm itself is never trusted, and any
+subgroup is discovered automatically.
 
 ---
 
@@ -148,8 +162,20 @@ but any use of the *absolute* label (compare-to-constant, ordering, arithmetic, 
 emitting a fresh-literal output label) is flagged. An unflagged BFS certifies
 species-equivariance, so one representative per **combined (translation × species)
 orbit** is BFS'd and the rest are derived by translating *and* relabeling — e.g.
-56→12 reps. A flag makes the checker fall back (sound; it never assumes). The
-derivation is validated to reproduce the direct-build graph exactly.
+56→12 reps. A flag makes the checker fall back (sound; it never assumes).
+
+When the algorithm declares its displacement set (`const MOVES`, the contract above)
+the BFS is reduced over the lattice **point group** as well. Directions drawn via
+`rand_move!` and applied with `move`/`rev` are tagged the same way labels are: any
+*absolute* use of a direction or a bare position offset is flagged, and the static
+subgroup of `D4` under which `MOVES` is closed is computed without running the
+rotated states. An unflagged BFS then certifies point-group equivariance, so one
+representative per **combined (translation × species × point-group) orbit** is BFS'd
+and the rest are derived by translating, relabeling *and* rotating (rotation
+preserves distances and types, so it leaves the symbolic weights unchanged) — e.g.
+single-Metropolis 56→**4**, VMMC-shuffle 12→**4**. Falls back per element of `D4` if
+flagged; the discovered subgroup is exactly right (e.g. column-only moves → D2). The
+derivation is validated to reproduce a direct all-states build exactly.
 
 ### 3. Exact symbolic weights (and the faithful VMMC ratio)
 A leaf weight is a rational coefficient times a product of acceptance factors.
@@ -228,13 +254,16 @@ The test suite checks every example's reduced verdict against the all-pairs base
   projection of the chambers onto its few active conditions, not once per chamber.
 - **Lazy, cached weight evaluation** and **hash-consed thresholds** so the model
   is built from unique weights, deduplicated by object identity.
-- **Translation + species orbit reduction (BFS — the bottleneck):** one
-  representative per *combined* (translation × species) orbit is BFS'd and its leaves
-  are translated *and* species-relabeled to the rest. Translation-equivariance is
-  certified by `τ` + the position-covariance guard; species-equivariance by a `τ`-style
-  **species tag** + a species-covariance guard, both during that single BFS. Falls
-  back to translation-only (then all-states) if a guard fires. E.g. a randomised-order
-  VMMC drops 56→12 reps; declining algorithms (sorted VMMC) are unaffected.
+- **Translation + species + point-group orbit reduction (BFS — the bottleneck):** one
+  representative per *combined* (translation × species × point-group) orbit is BFS'd and
+  its leaves are translated, species-relabeled *and* rotated to the rest.
+  Translation-equivariance is certified by `τ` + the position-covariance guard;
+  species-equivariance by a `τ`-style **species tag** + a species-covariance guard;
+  point-group equivariance by a **direction tag** (the `MOVES` contract) + static
+  `D4`-closure — all during that single BFS. Falls back per symmetry (then all-states)
+  if a guard fires. E.g. randomised-order VMMC drops 56→**4** reps (BFS ≈2.5 s → ≈0.8 s),
+  single-Metropolis 56→**4**; declining algorithms (sorted VMMC declines *species* but
+  still gets D4: 56→8) are handled soundly.
 - **Graph-verified symmetry reduction (DB check):** detailed balance is evaluated
   on one pair per orbit of the verified `(spatial p4m) × (species permutation)`
   group (§6) — any subgroup is discovered automatically from the computed graph.
@@ -251,40 +280,42 @@ The test suite checks every example's reduced verdict against the all-pairs base
 
 All examples live in `examples/`. Verdicts and chamber counts below are the exact
 results. **BFS'd** = states actually enumerated by the τ-BFS vs the total (the
-translation- and species-orbit reduction); **DB pairs** = pairs the graph-verified
-symmetry reduction checks vs the total. The `sym` column lists the verified
-**spatial** group (T = translations, D4 = full point group, T_c = column-only,
+translation × species × point-group orbit reduction); **DB pairs** = pairs the
+graph-verified symmetry reduction checks vs the total. The `sym` column lists the
+verified **spatial** group (T = translations, D4 = full point group, T_c = column-only,
 D2 = `{rot180, reflect_h, reflect_v}`) and the verified **species** group acting on
-the type labels (`S₃`, `S₂`, …).
+the type labels (`S₃`, `S₂`, …). A ★ marks an example that uses the `MOVES` contract,
+so its BFS is reduced over the point group too.
 
 | Example | Trans. | Detailed balance | Ergodicity | states | BFS'd | DB pairs | sym (spatial × species) |
 |---|---|---|---|---|---|---|---|
-| `single_metropolis.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
-| `kawasaki.jl` | PASS | PASS | FAIL (by design) | 504 | 12 | 6 / 756 | p4m × S₃ |
+| `single_metropolis.jl` ★ | PASS | PASS | PASS | 504 | **4** | 16 / 4536 | p4m × S₃ |
+| `kawasaki.jl` ★ | PASS | PASS | FAIL (by design) | 504 | **4** | 6 / 756 | p4m × S₃ |
 | `quadratic_field.jl` | **FAIL** (absolute field) | PASS | PASS | 12 | 12 | 4 / 16 | T_c, reflect_v × S₂ |
 | `broken_variable_pool.jl` | PASS | **FAIL** (pool 3 vs 4) | PASS | 72 | 4 | 3 / 252 | p4m × S₂ |
 | `broken_8way_hop.jl` | PASS | **FAIL** (pool 7 vs 8) | PASS | 240 | 9 | 10 / 1792 | p4m × S₂ |
 | `broken_biased_direction.jl` | PASS | **FAIL** (duplicated dir) | PASS | 504 | 12 | 46 / 4536 | T, reflect_h × S₃ |
 | `broken_metropolis_halfbeta.jl` | PASS | **FAIL** (`β/2`, half-int exp) | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
 | `broken_field_wrong_accept.jl` | PASS | **FAIL** (accept ignores field) | PASS | 12 | 3 | 4 / 16 | T_c, reflect_v × S₂ |
-| `vmmc_2d.jl` | PASS | PASS | PASS | 504 | 56 | 174 / 11088 | p4m (species declined) |
-| `hop_8way_correct.jl` | PASS | PASS | PASS | 240 | 9 | 10 / 1792 | p4m × S₂ |
-| `metropolis_4x4.jl` | PASS | PASS | PASS | 240 | 9 | 10 / 1792 | p4m × S₂ |
+| `vmmc_2d.jl` ★ | PASS | PASS | PASS | 504 | **8** | 174 / 11088 | p4m (species declined) |
+| `hop_8way_correct.jl` ★ | PASS | PASS | PASS | 240 | **5** | 10 / 1792 | p4m × S₂ |
+| `metropolis_4x4.jl` ★ | PASS | PASS | PASS | 240 | **5** | 10 / 1792 | p4m × S₂ |
 | `reflect_move.jl` | **FAIL** (non-covariant move) | PASS | FAIL | 72 | 72 | 4 / 42 | T_c, reflect_v × S₂ |
-| `horizontal_metropolis.jl` | PASS | PASS | FAIL (rows fixed) | 72 | 4 | 3 / 126 | **D2** × S₂ |
+| `horizontal_metropolis.jl` ★ | PASS | PASS | FAIL (rows fixed) | 72 | **3** | 3 / 126 | **D2** × S₂ |
 | `barker_accept.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
 | `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
-| `vmmc_2d_shuffle.jl` | PASS | PASS | PASS | 504 | 12 | 44 / 11088 | p4m × S₃ |
+| `vmmc_2d_shuffle.jl` ★ | PASS | PASS | PASS | 504 | **4** | 44 / 11088 | p4m × S₃ |
 | `hop_repeated_species.jl` | PASS | PASS | PASS | 756 | 42 | … | p4m × **S₂ (1↔2)** |
 | `broken_species_halfbeta.jl` | PASS | **FAIL** (species-dep. `β/2`) | PASS | 504 | 56 | … | T·D4 (species declined) |
 | `swap_literal_species.jl` | PASS | PASS | FAIL (N! perms) | 504 | 56 | … | T·D4 (species declined) |
 
-The last four are particle-swap / species edge cases (see "Species symmetry" below).
-`vmmc_2d_shuffle` is the headline: replacing VMMC's type-dependent candidate sort
-with a random shuffle makes it **species-equivariant**, so the BFS drops 56→12 reps
-(warm ≈6.3 s → ≈2.5 s). `vmmc_2d` itself **declines** species (its sort tie-breaks
-on the type label). The `sym` column shows exactly what the *graph* has, not what
-was assumed.
+`vmmc_2d_shuffle` is the headline: with the `MOVES` contract its BFS drops 56→**4**
+reps (warm BFS ≈2.5 s → ≈0.8 s) — species *and* full-D4 reduction. `vmmc_2d` declines
+*species* (its sort tie-breaks on the type label) but still gets the full point group
+(56→8) — a clean demonstration that the two reductions are independent.
+`horizontal_metropolis` (column-only moves) discovers exactly **D2**, not D4. The
+last few rows are particle-swap / species edge cases. The `sym` column shows exactly
+what the *graph* has, not what was assumed.
 `broken_biased_direction` gets `reflect_h` but not `reflect_v`/`rotate90` (the
 column bias survives a row-flip, not a column-flip). The row-field examples
 (`quadratic_field`, `broken_field_wrong_accept`, `reflect_move`) get column
@@ -396,4 +427,5 @@ whenever it meets something it cannot represent exactly:
 | `doc/expressiveness.md` | the exact class of weight/energy/condition functions handled |
 | `ideas.md` | analysis of inductive generalisation across system sizes, and D4 |
 | `type-taint.md` + `doc/typetaint_poc.jl` | the species-equivariance certificate for the BFS (PoC + the analysis that led to it; now implemented) |
+| `doc/rotation-taint.md` + `doc/rotation_taint*_poc.jl` | the point-group (D4) BFS reduction via the supplied-direction `MOVES` contract (PoCs + analysis; now implemented) |
 | `doc/dbc_method.{tex,pdf}` | a 2-page method writeup |

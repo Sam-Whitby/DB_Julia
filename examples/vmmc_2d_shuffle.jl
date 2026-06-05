@@ -24,7 +24,10 @@ const NGRID          = 3
 const MAXD2          = 2
 const PARTICLE_TYPES = [1, 2, 3]
 
-const VMMC_DISPS = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]
+# Supplied direction set (the contract): the 8 unit displacements, closed under D4.
+# The cluster displacement is drawn via rand_move! and applied with move/rev, so the
+# checker can also certify point-group (D4) equivariance of this VMMC variant.
+const MOVES = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]
 
 function energy(state::PState)::LinForm
     lf = LinForm()
@@ -42,8 +45,6 @@ function pairE(ti, tj, pi::Particle, pj::Particle, n::Int)::LinForm
     (0 < d2 <= MAXD2) && addcoef!(lf, Jc(ti, tj, d2), TauNum(1))
     lf
 end
-
-shift(p::Particle, d) = Particle(p.r + d[1], p.c + d[2], p.t)
 
 wfwd_threshold(eInit::LinForm, eFwd::LinForm) =
     th_piece([([c_lt(eInit, eFwd)],
@@ -70,7 +71,7 @@ function build_cluster(rng, state::PState, n::Int, seedidx::Int, dir)
     cluster = [seedidx]; incluster = Set(cluster); queue = [seedidx]
     while !isempty(queue)
         pidx = popfirst!(queue); p = state[pidx]
-        pPost = shift(p, dir); pRev = shift(p, (-dir[1], -dir[2]))
+        pPost = move(p, dir); pRev = move(p, rev(dir))
         cands = Int[]
         for qi in 1:length(state)
             (qi in incluster) && continue
@@ -98,7 +99,7 @@ end
 function algorithm(rng, state::PState)::PState
     isempty(state) && return state
     seedidx = rand_choice_index!(rng, length(state))
-    dir     = rand_choice!(rng, VMMC_DISPS)
+    dir     = rand_move!(rng)
 
     cl = build_cluster(rng, state, NGRID, seedidx, dir)
     cl === :frustrated && return state
@@ -106,10 +107,10 @@ function algorithm(rng, state::PState)::PState
     clset = Set(cl)
     noncluster = eltype(state)[state[i] for i in 1:length(state) if !(i in clset)]
     for ci in cl
-        dest = shift(state[ci], dir)
+        dest = move(state[ci], dir)
         for q in noncluster
             same_site(q, dest, NGRID) && return state
         end
     end
-    vcat(noncluster, eltype(state)[shift(state[ci], dir) for ci in cl])
+    vcat(noncluster, eltype(state)[move(state[ci], dir) for ci in cl])
 end

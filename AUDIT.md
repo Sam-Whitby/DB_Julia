@@ -425,5 +425,57 @@ New examples cover the cases: `vmmc_2d_shuffle` (species-equivariant VMMC, the w
 `hop_repeated_species` ([1,1,2,2] repeated-multiplicity S2), `broken_species_halfbeta`
 (species-dependent acceptance -> declined, DB-FAIL still caught), `swap_literal_species`
 (raw-label output -> covariance guard declines, DB still correct), plus a robustness
-test that an un-overloaded label op declines instead of crashing. 249 tests pass
-(serial and `-t auto`).
+test that an un-overloaded label op declines instead of crashing.
+
+### 5.14 Point-group (D4) certificate: reducing the tau-BFS via supplied directions (implemented)
+
+`rotation-taint.md` first PROVED that, under the existing contract (directions
+hardcoded inside the algorithm), the lattice point group CANNOT join the tau-BFS:
+rotation is realised by an rng-outcome permutation, not identical control flow, so
+there is no single-BFS certificate, and deriving an un-BFS'd state by rotation is
+unsound. It then showed that a CHANGED contract removes the obstruction: if the
+displacement set is SUPPLIED (`const MOVES`) and declared closed under the group,
+directions become covariant objects the point group permutes — structurally identical
+to species labels — and a single clean BFS certifies equivariance.
+
+Design (the same tau-level rigor as species):
+- A `DirTag` wraps a declared direction during the probe; `rand_move!` returns one
+  (uniform selection, so the choice weight is point-group-invariant by construction);
+  `move(p, ::DirTag)` shifts covariantly via a TauNum constructor (bypassing `+`), and
+  `rev` gives the covariant reverse. Any OTHER use of a direction (a tuple/hardcoded
+  offset reaching `move`, a bare `TauNum ± Integer` position arithmetic) sets a
+  thread-local rotation flag while the probe is active (`_ROT_PROBE`); a single shared
+  Bool keeps the off-path cost to one read.
+- The static half — which subgroup of `D4` the move set is closed under — is computed
+  from `MOVES` alone (`pointgroup_subgroup`), WITHOUT running any rotated state. The
+  closed set is automatically a subgroup, and each member is a genuine graph symmetry
+  once the probe is clean. An empty `MOVES` (pure type-swap, e.g. kawasaki) is
+  vacuously closed under all of D4.
+- `build_transitions` runs ONE probe (tagged labels if species>1, rotation flagging if
+  a non-trivial subgroup exists), then DOWNGRADES to whatever was actually certified —
+  reducing over the combined (translation x species x point-group) orbit and deriving
+  every state by translate ∘ rotate ∘ species-relabel. Rotation preserves distances and
+  types, so it leaves the symbolic WEIGHTS unchanged (only the species relabel permutes
+  atoms). The point-group reduction is opt-in (engaged only when `MOVES` is declared);
+  without it the engine behaves exactly as before (`use_pointgroup=false` forces this).
+
+Containment: positions are already used point-group-covariantly through the existing
+covariant primitives (`pbc_d2`, `same_site` return isometry invariants), so the only
+rotation-breaking operation is the move, which the `DirTag`/`move`/bare-arithmetic
+flags pin down; the no-raw-unwrap discipline is the same as tau/species; the
+derivation is CHECKED not trusted — the suite verifies the fully-reduced graph equals
+a DIRECT all-states BFS at random coupling points, and that the discovered subgroup is
+exactly right (D4 for king-moves, D2 for column-only `horizontal_metropolis`), and
+that bypassing the contract DECLINES the point group (never a silent wrong reduction).
+
+Examples converted to the contract: `single_metropolis`/`metropolis_4x4`/
+`hop_8way_correct` (D4, 56->4 / larger), `horizontal_metropolis` (D2),
+`vmmc_2d_shuffle` (species + D4, warm BFS ~2.5 s -> ~0.8 s), `vmmc_2d` (D4 only —
+declines species via its sort, proving the two reductions are independent),
+`kawasaki` (empty move set -> vacuous D4 + species). 275 tests pass (serial and
+`-t auto`).
+
+A test-harness fragility surfaced and was fixed in passing: redefining a `const`
+(`NGRID`, `PARTICLE_TYPES`, `MOVES`) across sequential `include`s into `Main` is
+unreliable on Julia 1.12 (it silently kept a previous example's value), so each
+example is now loaded into a FRESH module — no cross-example const collisions.

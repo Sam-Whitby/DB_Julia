@@ -88,6 +88,20 @@ Base.convert(::Type{TauNum}, v::Rational) = TauNum(v)
 Base.promote_rule(::Type{TauNum}, ::Type{<:Integer})  = TauNum
 Base.promote_rule(::Type{TauNum}, ::Type{<:Rational}) = TauNum
 
+# ---- rotation/reflection (point-group) taint flag — see SECTION 1c -----------
+# `_ROT_PROBE` is true ONLY while the point-group-equivariance probe runs. When on,
+# a bare position+offset (TauNum ± Integer/Rational) is a rotation violation: the
+# only point-group-COVARIANT way to shift a position is `move(p, d)` with d a
+# DECLARED direction (which bypasses this via a direct TauNum constructor). When off
+# (the normal / fallback BFS, and every non-rotation example) arithmetic is normal,
+# so this adds only one Bool read on the position-add hot path.
+const _ROT_PROBE = Ref(false)
+const _ROT_BAD   = [false]                                 # thread-local, like _TAU
+const _ROT_MSG   = [""]
+rot_violation!(m::String) = (i = Threads.threadid(); _ROT_BAD[i] = true; _ROT_MSG[i] = m; nothing)
+@inline _rotchk() = (_ROT_PROBE[] && rot_violation!(
+    "bare position±offset during the point-group probe; shift via move(p, d) with a declared direction"); nothing)
+
 Base.:+(a::TauNum, b::TauNum) = TauNum(a.v+b.v, a.cr+b.cr, a.cc+b.cc, a.tainted|b.tainted)
 Base.:-(a::TauNum, b::TauNum) = TauNum(a.v-b.v, a.cr-b.cr, a.cc-b.cc, a.tainted|b.tainted)
 Base.:-(a::TauNum)            = TauNum(-a.v, -a.cr, -a.cc, a.tainted)
@@ -105,10 +119,10 @@ function Base.:*(a::TauNum, b::TauNum)
     TauNum(v, cr, cc, nonlinear)
 end
 
-Base.:+(a::TauNum, b::Union{Integer,Rational}) = a + TauNum(b)
-Base.:+(a::Union{Integer,Rational}, b::TauNum) = TauNum(a) + b
-Base.:-(a::TauNum, b::Union{Integer,Rational}) = a - TauNum(b)
-Base.:-(a::Union{Integer,Rational}, b::TauNum) = TauNum(a) - b
+Base.:+(a::TauNum, b::Union{Integer,Rational}) = (_rotchk(); a + TauNum(b))
+Base.:+(a::Union{Integer,Rational}, b::TauNum) = (_rotchk(); TauNum(a) + b)
+Base.:-(a::TauNum, b::Union{Integer,Rational}) = (_rotchk(); a - TauNum(b))
+Base.:-(a::Union{Integer,Rational}, b::TauNum) = (_rotchk(); TauNum(a) - b)
 Base.:*(a::TauNum, b::Union{Integer,Rational}) = a * TauNum(b)
 Base.:*(a::Union{Integer,Rational}, b::TauNum) = TauNum(a) * b
 
@@ -241,6 +255,45 @@ for op in (:+, :-, :*)
     @eval Base.$op(a::TypeTag, b::TypeTag) = (species_violation!("species-label arithmetic ($($(QuoteNode(op))))"); $op(a.v, b.v))
 end
 
+# ============================================================================
+# SECTION 1c — DirTag: a direction tag for certifying point-group equivariance
+# ============================================================================
+# A lattice point-group element (90° rotation / reflection — the D4 of the square
+# torus) acts on positions by MIXING coordinates, and a move written as
+# `pos + (dr,dc)` with a HARDCODED offset is an ABSOLUTE constant that does not
+# rotate, so such a move cannot be certified rotation-equivariant from one BFS
+# (see doc/rotation-taint.md §1–§6). The fix (doc/rotation-taint.md §7): SUPPLY the
+# direction set as a declared object `MOVES`, require moves to be expressed as
+# `move(p, d)` with d drawn from `MOVES` via `rand_move!`, and tag the directions.
+# A direction then becomes a covariant object the point group PERMUTES — exactly
+# like a species label under a permutation. If
+#   (i)  MOVES is closed under a point-group element g (a STATIC check), and
+#   (ii) the BFS is CLEAN (every move went through move(p, ::DirTag) from
+#        rand_move!; no bare position arithmetic; no absolute-position / species
+#        misuse),
+# then the algorithm is g-equivariant and the tau-BFS can be reduced over the
+# (translation × species × point-group) orbit. Soundness rests on the same no-raw-
+# unwrap discipline as tau (tau0) and species (t.v); the validation test in
+# test_db.jl (rotation-reduced graph == direct build) backs it.
+#
+# A DirTag is OPAQUE: `move(p, ::DirTag)` is the only blessed use; any inspection
+# (component access via indexing/iteration, comparison, arithmetic) is not
+# overloaded and raises a MethodError, which the probe catches and treats as
+# "decline rotation" — never a crash, never a silent pass.
+struct DirTag; dr::Int; dc::Int; end
+
+const _MOVESET = Ref(Tuple{Int,Int}[])                     # declared MOVES (set per run)
+
+# rand_move!: pick a direction UNIFORMLY from the declared set (so the selection
+# weight is point-group-invariant by construction). During the probe it returns a
+# DirTag (opaque, covariant); otherwise a plain tuple (the fast/fallback path).
+function rand_move!(rng)
+    ms = _MOVESET[]
+    isempty(ms) && cant("rand_move! called but no MOVES were declared")
+    i = rand_choice_index!(rng, length(ms))
+    _ROT_PROBE[] ? DirTag(ms[i][1], ms[i][2]) : ms[i]
+end
+
 # ---- particles / states ----
 # Particle is parametric in the species-label type T so the SAME user code can run
 # with plain Int labels (the fast default / concrete path) or with a tagged label
@@ -264,6 +317,26 @@ aug_particle_tag(r::Int, c::Int, t::Int) = Particle(tau_r_aug(r), tau_c_aug(c), 
 # Extract the integer species label from either a plain Int or a TypeTag.
 typeval(t::Int)::Int = t
 typeval(t::TypeTag)::Int = t.v
+
+# move(p, d): shift a particle by a direction d, the ONLY point-group-covariant way
+# to move. Two flavours mirror the two label flavours:
+#   * d::Tuple — the fast / fallback path (plain arithmetic). During the probe a
+#     tuple direction means the algorithm bypassed rand_move! (used a hardcoded or
+#     index-selected offset), which is NOT certifiable, so it is flagged.
+#   * d::DirTag — the probe path: a declared, opaque direction. `_covshift` builds
+#     the shifted coordinate via the TauNum CONSTRUCTOR (not `+`), so it does not
+#     trip the bare-arithmetic rotation flag; the shift is covariant by contract.
+_covshift(coord::TauNum, k::Int) = TauNum(coord.v + k, coord.cr, coord.cc, coord.tainted)
+move(p::Particle, d::Tuple) =
+    (_ROT_PROBE[] && rot_violation!("move with a non-declared direction (not from rand_move!)");
+     Particle(p.r + d[1], p.c + d[2], p.t))
+move(p::Particle, d::DirTag) = Particle(_covshift(p.r, d.dr), _covshift(p.c, d.dc), p.t)
+
+# rev(d): the reverse of a direction (covariant — negation commutes with the point
+# group). Lets an algorithm probe the backward displacement (e.g. VMMC's reverse
+# energy) without breaking the point-group certificate, since -d is also covariant.
+rev(d::Tuple)  = (-d[1], -d[2])
+rev(d::DirTag) = DirTag(-d.dr, -d.dc)
 
 # ---- geometry (all flag tau-violation if used on a tau-dependent value) ----
 
@@ -327,6 +400,8 @@ function _init_threadlocal!()
     resize!(_TAU_MSG, nt);      fill!(_TAU_MSG, "")
     resize!(_SPECIES_BAD, nt);  fill!(_SPECIES_BAD, false)
     resize!(_SP_MSG, nt);       fill!(_SP_MSG, "")
+    resize!(_ROT_BAD, nt);      fill!(_ROT_BAD, false)
+    resize!(_ROT_MSG, nt);      fill!(_ROT_MSG, "")
     resize!(_TH_CACHES, nt)
     for i in 1:nt; _TH_CACHES[i] = Dict{Any,ThExpr}(); end
     nothing
@@ -336,6 +411,9 @@ _tau_first_msg() = (i = findfirst(!isempty, _TAU_MSG); i === nothing ? "" : _TAU
 _species_clear!() = (for i in eachindex(_SPECIES_BAD); _SPECIES_BAD[i] = false; _SP_MSG[i] = ""; end)
 _species_any()  = any(_SPECIES_BAD)
 _species_first_msg() = (i = findfirst(!isempty, _SP_MSG); i === nothing ? "" : _SP_MSG[i])
+_rot_clear!() = (for i in eachindex(_ROT_BAD); _ROT_BAD[i] = false; _ROT_MSG[i] = ""; end)
+_rot_any()  = any(_ROT_BAD)
+_rot_first_msg() = (i = findfirst(!isempty, _ROT_MSG); i === nothing ? "" : _ROT_MSG[i])
 
 # ----------------------------------------------------------------------------
 # Exact rational functions of exp-monomials (BSum / Val)
@@ -793,6 +871,41 @@ reflect_v_cstate(cs::CState, n::Int)::CState =
 reflect_ad_cstate(cs::CState, n::Int)::CState =
     sort(NTuple{3,Int}[(n + 1 - c, n + 1 - r, t) for (r, c, t) in cs])
 
+# The point group as (name, cstate-action, direction-linear-part). The cstate
+# action transforms a whole concrete state; the linear part transforms a (dr,dc)
+# DIRECTION (the homogeneous, translation-free part of the same isometry). Identity
+# is first. These pair up exactly: applying the cstate action to a state moved by d
+# equals applying it to the state and moving by lin(d). That correspondence is why
+# "MOVES closed under lin" + "clean probe" ⟹ the cstate action is a graph symmetry.
+const _POINTGROUP = [
+    ("identity",   (cs,n)->cs,                  ((dr,dc),)->(dr, dc)),
+    ("rotate90",   rotate_cstate,               ((dr,dc),)->(dc, -dr)),
+    ("rotate180",  rotate180_cstate,            ((dr,dc),)->(-dr, -dc)),
+    ("rotate270",  rotate270_cstate,            ((dr,dc),)->(-dc, dr)),
+    ("reflect",    reflect_cstate,              ((dr,dc),)->(dc, dr)),
+    ("reflect_h",  reflect_h_cstate,            ((dr,dc),)->(-dr, dc)),
+    ("reflect_v",  reflect_v_cstate,            ((dr,dc),)->(dr, -dc)),
+    ("reflect_ad", reflect_ad_cstate,           ((dr,dc),)->(-dc, -dr)),
+]
+
+# The SUBGROUP of the point group under which the declared direction set is closed.
+# Returns the indices into _POINTGROUP (always includes 1 = identity). This is the
+# STATIC half of the rotation certificate: a property of the params, provable
+# without running R·s. The closed set is automatically a subgroup (closed under
+# composition and inverse), and each member is a genuine symmetry once the probe
+# is clean. An empty MOVES (no position moves, e.g. a pure type-swap) is vacuously
+# closed under all of D4.
+function pointgroup_subgroup(moves::Vector{Tuple{Int,Int}})::Vector{Int}
+    S = Set(moves)
+    idxs = Int[]
+    for (i, (_, _, lin)) in enumerate(_POINTGROUP)
+        all(lin(d) in S for d in moves) && push!(idxs, i)
+    end
+    idxs
+end
+pt_apply(cs::CState, gi::Int, n::Int)::CState = _POINTGROUP[gi][2](cs, n)
+pt_name(gi::Int) = _POINTGROUP[gi][1]
+
 # Partition states into translation orbits. Returns the reps and, per state,
 # (rep, (dr,dc)) such that translate(rep, dr,dc) == state.
 function translation_orbits(states::Vector{CState}, n::Int)
@@ -859,6 +972,27 @@ function combined_trep_orbits(treps::Vector{CState}, repof_t::Dict{CState,CState
     creps, crep_of, k_of
 end
 
+# Orbits of the translation reps under the FULL reduction group: species
+# permutations σ TIMES the point-group subgroup H (indices Hidx into _POINTGROUP).
+# Returns the combined reps and, per trep `tr`, a pair (combined_rep, (k, gi)) with
+#     repof_t[ pt_apply(relabel(combined_rep, σ_k), gi) ] == tr.
+# Species relabel and point-group action commute (labels vs positions), so the
+# composite is well defined. With σgroup=[identity] and Hidx=[1] this degenerates
+# to the plain translation reduction; with Hidx=[1] to combined_trep_orbits.
+function combined_trep_orbits_pg(treps::Vector{CState}, repof_t::Dict{CState,CState},
+                                 σgroup::Vector{Dict{Int,Int}}, Hidx::Vector{Int}, n::Int)
+    crep_of = Dict{CState,CState}(); kg_of = Dict{CState,Tuple{Int,Int}}(); creps = CState[]
+    for tr in treps
+        haskey(crep_of, tr) && continue
+        push!(creps, tr)
+        for (k, σ) in enumerate(σgroup), gi in Hidx
+            tr2 = repof_t[ pt_apply(relabel_cstate(tr, σ), gi, n) ]
+            if !haskey(crep_of, tr2); crep_of[tr2] = tr; kg_of[tr2] = (k, gi); end
+        end
+    end
+    creps, crep_of, kg_of
+end
+
 struct BFSResult
     states       :: Vector{CState}
     idx          :: Dict{CState,Int}
@@ -869,6 +1003,8 @@ struct BFSResult
     n            :: Int                          # lattice side (for symmetry actions)
     species_free :: Bool                         # species-equivariant BFS reduction used?
     nbfs         :: Int                          # number of states actually BFS'd
+    pg_idx       :: Vector{Int}                  # point-group elements used (indices into
+                                                 # _POINTGROUP); empty if none beyond identity
 end
 
 # BFS a list of seed states, optionally across threads. Each thread uses its own
@@ -902,65 +1038,94 @@ function _unwrap_cant(e)
 end
 
 function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdepth::Int;
-                           parallel::Bool=false, species::Bool=true)::BFSResult
-    _init_threadlocal!()                    # fresh per-thread interning + tau/species flags
+                           parallel::Bool=false, species::Bool=true,
+                           moves::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing,
+                           use_pointgroup::Bool=true)::BFSResult
+    _init_threadlocal!()                    # fresh per-thread interning + tau/species/rot flags
     idx = Dict(cs => i for (i, cs) in enumerate(states))
     uweights = Leaf[]; uw_idx = Dict{Any,Int}()
     widx!(lf::Leaf) = get!(uw_idx, _weight_key(lf)) do; push!(uweights, lf); length(uweights) end
     trans = Tuple{Int,Int,Int}[]
 
     treps, repof, gof = translation_orbits(states, n)
-    σgroup = species ? _type_group_full(Int[t for (r,c,t) in states[1]]) : Dict{Int,Int}[Dict()]
+    fullσ  = _type_group_full(Int[t for (r,c,t) in states[1]])      # identity first
+    σgroup = species ? fullσ : Dict{Int,Int}[fullσ[1]]
     rep_leaves = Dict{CState,Vector{Leaf}}()
 
-    # --- attempt the COMBINED (translation x species) BFS reduction --------------
-    # When the algorithm is species-equivariant we BFS one rep per COMBINED orbit
-    # (far fewer than per translation orbit) using TAGGED labels, which certify
-    # species-equivariance from that single BFS. If certified, every other state's
-    # transitions are derived by translating AND species-relabeling a rep's leaves.
-    if length(σgroup) > 1
-        creps, crep_of, k_of = combined_trep_orbits(treps, repof, σgroup)
-        _species_clear!()
-        # The tagged probe may hit an un-overloaded label operation (e.g. `p.t ^ 2`)
-        # and throw a MethodError. That is not a failure of the checker — it just
-        # means species-equivariance cannot be certified — so treat ANY non-CantHandle
-        # error as "decline species" and fall back. CantHandle (e.g. maxdepth) is a
-        # genuine limit and propagates. (The fallback BFS uses Int labels, so a real
-        # bug in the algorithm still surfaces there.)
+    # Point-group: the static subgroup H under which the declared MOVES are closed.
+    # `_MOVESET` is still set when MOVES are declared (so rand_move!/move work on the
+    # normal path) even with `use_pointgroup=false`, which forces H = {identity} —
+    # the validation baseline (same algorithm, no point-group reduction).
+    if moves === nothing
+        _MOVESET[] = Tuple{Int,Int}[]; Hidx = Int[1]
+    else
+        _MOVESET[] = moves; Hidx = use_pointgroup ? pointgroup_subgroup(moves) : Int[1]
+    end
+
+    # --- general derivation: build every state's transitions from the combined reps
+    # by translate ∘ point-group ∘ species-relabel. Point-group preserves distances
+    # and types so it leaves WEIGHTS unchanged; only the species relabel permutes
+    # atoms (permwi). cr_of: trep->combined-rep, kg_of: trep->(σ-index, pg-index).
+    function derive!(creps, cr_of, kg_of, σg)
+        wi_of = IdDict{Leaf,Int}()
+        for cr in creps, lf in rep_leaves[cr]; wi_of[lf] = widx!(lf); end
+        wcache = Dict{Tuple{Int,Int},Int}()                 # (base wi, σ-index k) -> wi
+        permwi(wi::Int, lf::Leaf, k::Int) = k == 1 ? wi : get!(wcache, (wi, k)) do
+            σ = σg[k]
+            widx!(Leaf(lf.next, lf.coeff,
+                       ThFactor[ThFactor(permute_atoms_th(f.thr, σ), f.accepted) for f in lf.factors]))
+        end
+        for (s, si) in idx
+            tr = repof[s]; cr = cr_of[tr]; (k, gi) = kg_of[tr]; σ = σg[k]
+            base = pt_apply(relabel_cstate(cr, σ), gi, n)   # == translate(tr, a)
+            a = gof[base]
+            dr = mod(gof[s][1] - a[1], n); dc = mod(gof[s][2] - a[2], n)
+            for lf in rep_leaves[cr]
+                nxt = translate_cstate(pt_apply(relabel_cstate(lf.next, σ), gi, n), dr, dc, n)
+                dst = idx[nxt]
+                dst != si && push!(trans, (si, dst, permwi(wi_of[lf], lf, k)))
+            end
+        end
+    end
+
+    # --- attempt the COMBINED (translation × species × point-group) BFS reduction.
+    # BFS one rep per FULL combined orbit using tagged labels (certify species) and
+    # tagged directions / rotation-arithmetic flagging (certify point-group), all
+    # from a single BFS. We then DOWNGRADE to whatever was actually certified
+    # (species and/or point-group), BFS-ing only the extra reps the coarser orbit
+    # needs (already-BFS'd reps are reused), and derive everything from them.
+    want_probe = length(σgroup) > 1 || length(Hidx) > 1
+    if want_probe
+        creps0, _, _ = combined_trep_orbits_pg(treps, repof, σgroup, Hidx, n)
+        _species_clear!(); _rot_clear!()
+        seedfn = length(σgroup) > 1 ? augmented_pstate_tag : augmented_pstate
+        _ROT_PROBE[] = length(Hidx) > 1
         probe_ok = true
         try
-            crep_leaf_vec = _bfs_seeds(algo, creps, n, maxdepth, parallel; seedfn = augmented_pstate_tag)
-            for i in eachindex(creps); rep_leaves[creps[i]] = crep_leaf_vec[i]; end
+            vec = _bfs_seeds(algo, creps0, n, maxdepth, parallel; seedfn = seedfn)
+            for i in eachindex(creps0); rep_leaves[creps0[i]] = vec[i]; end
         catch e
             (e isa CantHandle) && rethrow(e)
             probe_ok = false; empty!(rep_leaves); _init_threadlocal!()   # discard probe state
+        finally
+            _ROT_PROBE[] = false
         end
-        if probe_ok && !_tau_any() && !_species_any()
-            # CERTIFIED species-equivariant: derive all states from the combined reps.
-            # Precompute, per species element, the relabeled-weight index of each
-            # combined-rep leaf (translation does not change weights).
-            wi_of = IdDict{Leaf,Int}()
-            for r in creps, lf in rep_leaves[r]; wi_of[lf] = widx!(lf); end
-            wcache = Dict{Tuple{Int,Int},Int}()                 # (base wi, σ-index k) -> wi
-            permwi(wi::Int, lf::Leaf, k::Int) = k == 1 ? wi : get!(wcache, (wi, k)) do
-                σ = σgroup[k]
-                widx!(Leaf(lf.next, lf.coeff,
-                           ThFactor[ThFactor(permute_atoms_th(f.thr, σ), f.accepted) for f in lf.factors]))
+        if probe_ok && !_tau_any()
+            use_species = length(σgroup) > 1 && !_species_any()
+            use_pg      = length(Hidx)  > 1 && !_rot_any()
+            σg = use_species ? σgroup : Dict{Int,Int}[σgroup[1]]
+            Hi = use_pg ? Hidx : Int[1]
+            creps, cr_of, kg_of = combined_trep_orbits_pg(treps, repof, σg, Hi, n)
+            need = CState[cr for cr in creps if !haskey(rep_leaves, cr)]
+            if !isempty(need)
+                extra = _bfs_seeds(algo, need, n, maxdepth, parallel)   # Int seeds, no probe
+                for i in eachindex(need); rep_leaves[need[i]] = extra[i]; end
             end
-            for (s, si) in idx
-                tr = repof[s]; cr = crep_of[tr]; k = k_of[tr]; σ = σgroup[k]
-                a  = gof[relabel_cstate(cr, σ)]                 # relabel(cr,σ) = translate(tr, a)
-                dr = mod(gof[s][1] - a[1], n); dc = mod(gof[s][2] - a[2], n)
-                for lf in rep_leaves[cr]
-                    nxt = translate_cstate(relabel_cstate(lf.next, σ), dr, dc, n)
-                    dst = idx[nxt]
-                    dst != si && push!(trans, (si, dst, permwi(wi_of[lf], lf, k)))
-                end
-            end
-            return BFSResult(states, idx, uweights, trans, true, "", n, true, length(creps))
+            derive!(creps, cr_of, kg_of, σg)
+            return BFSResult(states, idx, uweights, trans, true, "", n,
+                             use_species, length(creps), use_pg ? Hidx : Int[])
         end
-        # Not certified: keep the combined reps' leaves (tags don't change leaves)
-        # and fall through, BFS-ing only the remaining translation reps below.
+        # Not certified at all (tau flagged): keep any BFS'd leaves and fall through.
     end
 
     # --- translation-only reduction / all-states fallback -----------------------
@@ -979,7 +1144,7 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
                 dst != si && push!(trans, (si, dst, wi_of[lf]))
             end
         end
-        return BFSResult(states, idx, uweights, trans, true, tau_msg, n, false, length(treps))
+        return BFSResult(states, idx, uweights, trans, true, tau_msg, n, false, length(treps), Int[])
     end
 
     # Not translation invariant: direct BFS from EVERY state (no equivariance).
@@ -992,7 +1157,7 @@ function build_transitions(algo, energy, states::Vector{CState}, n::Int, maxdept
             dst != si && push!(trans, (si, dst, wi))
         end
     end
-    BFSResult(states, idx, uweights, trans, false, tau_msg, n, false, length(states))
+    BFSResult(states, idx, uweights, trans, false, tau_msg, n, false, length(states), Int[])
 end
 
 # Reachability ergodicity: BFS over the directed transition graph from the seed.

@@ -189,6 +189,20 @@ see §7, which is the right way to actually get the point group into the BFS.
 
 ## 7. Supplied directions change the contract — and the conclusion
 
+> **STATUS — now IMPLEMENTED.** The supplied-directions point-group BFS reduction
+> described in this section is shipped in `dbc.jl` (the `DirTag`/`move`/`rand_move!`/
+> `rev` contract, the `pointgroup_subgroup` static closure check, and the
+> translation×species×point-group orbit reduction in `build_transitions`). Examples
+> that declare `const MOVES` opt in; the checker reports the certified subgroup and
+> reduces the τ-BFS accordingly. Measured wins (warm BFS): single_metropolis 56→4
+> reps, vmmc_2d_shuffle 12→4 reps (~2.5 s → ~0.8 s), vmmc_2d → D4-only 56→8 reps
+> (~2.5 s → ~0.7 s), horizontal_metropolis discovers exactly D2. Soundness is
+> validated by a graph-equality test against a direct all-states build (AUDIT
+> §5.14). The remaining-problems in §7.1 were handled exactly as proposed (trusted
+> primitives, fail-loud probe, covariance via the existing τ gate, graph-equality
+> validation).
+
+
 The whole §1–§6 obstruction rests on one thing: a **hardcoded** offset like `(1,0)`
 is an **absolute constant**. Under rotation it does *not* transform, so it cannot be
 "relabeled", and the per-rng path `move (1,0)` on `s` has no covariant counterpart

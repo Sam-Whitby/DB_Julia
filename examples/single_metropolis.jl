@@ -7,14 +7,20 @@
 #   3. Reject immediately if the target site is occupied.
 #   4. Accept with probability min(1, exp(-beta * dE)).
 #
-# Expected result:  tau PASS,  DB PASS
+# Directions are SUPPLIED (the `MOVES` contract) and the move is written
+# `move(p, rand_move!(rng))`, so the checker can certify point-group equivariance
+# and reduce the tau-BFS over the lattice point group too (here the full D4, since
+# the 8 king-move displacements are closed under all of D4) — see doc/rotation-taint.md.
+#
+# Expected result:  tau PASS,  DB PASS,  point group = full D4
 # ============================================================================
 
 const NGRID          = 3
 const MAXD2          = 2
 const PARTICLE_TYPES = [1, 2, 3]
 
-const SM_DISPS = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]
+# Supplied direction set (the contract). The 8 king moves are closed under D4.
+const MOVES = [(dx, dy) for dx in -1:1 for dy in -1:1 if (dx, dy) != (0, 0)]
 
 # Pairwise energy: sum of couplingJ[type_a, type_b, d2] over close pairs.
 function energy(state::PState)::LinForm
@@ -30,8 +36,7 @@ end
 function algorithm(rng, state::PState)::PState
     pidx = rand_choice_index!(rng, length(state))
     p    = state[pidx]
-    (dr, dc) = rand_choice!(rng, SM_DISPS)
-    newp = Particle(p.r + dr, p.c + dc, p.t)      # no Mod — harness normalises
+    newp = move(p, rand_move!(rng))               # covariant move from the declared set
     rest = state[setdiff(1:length(state), pidx)]
 
     # Hard-core rejection: target occupied?  (difference => tau cancels)
