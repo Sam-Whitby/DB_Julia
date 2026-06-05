@@ -18,10 +18,12 @@
 # the algorithm, used to speed the check via orbit reduction when it holds). It
 # need not be declared. D4 / point-group symmetry is never used.
 #
-# Exit code 0 iff: detailed balance holds, the chain is ergodic, and the state
-# count matches the combinatorial formula. (Translational invariance is reported
-# but does not by itself fail the run — see quadratic_field, an absolute-field
-# algorithm that is correct yet not translation invariant.)
+# Exit code 0 iff: the balance condition holds, the chain is ergodic, and the state
+# count matches the combinatorial formula. The condition is DETAILED balance by
+# default, or GLOBAL balance (pi*T=pi, the weaker necessary condition) with -balance.
+# (Translational invariance is reported but does not by itself fail the run — see
+# quadratic_field, an absolute-field algorithm that is correct yet not translation
+# invariant.)
 # ============================================================================
 
 include(joinpath(@__DIR__, "dbc.jl"))
@@ -31,17 +33,18 @@ const SEP2 = "-"^64
 
 function parse_args(argv)
     isempty(argv) &&
-        (println("Usage: julia [-t auto] check.jl <algorithm.jl> [-maxdepth N] [-parallel]"); exit(1))
+        (println("Usage: julia [-t auto] check.jl <algorithm.jl> [-maxdepth N] [-parallel] [-balance]"); exit(1))
     algfile = argv[1]
     isfile(algfile) || (println("ERROR: file not found: ", algfile); exit(1))
-    maxdepth = 30; parallel = false; i = 2
+    maxdepth = 30; parallel = false; balance = false; i = 2
     while i <= length(argv)
         if argv[i] == "-maxdepth"; maxdepth = parse(Int, argv[i+1]); i += 2
         elseif argv[i] == "-parallel"; parallel = true; i += 1
+        elseif argv[i] == "-balance" || argv[i] == "--balance"; balance = true; i += 1
         else; println("ERROR: unknown option ", argv[i]); exit(1)
         end
     end
-    (algfile, maxdepth, parallel)
+    (algfile, maxdepth, parallel, balance)
 end
 
 # Canonical seed state: first N row-major sites, sorted types. Used as the
@@ -51,7 +54,9 @@ function canonical_seed(types::Vector{Int}, n::Int)::CState
     sort(NTuple{3,Int}[(pos[k][1], pos[k][2], st[k]) for k in 1:length(st)])
 end
 
-function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
+function run_checker(algfile, maxdepth, parallel, balance, n, types, algo, energy)
+    cond_name = balance ? "Global balance" : "Detailed balance"
+    cond_abbr = balance ? "Balance      " : "Detailed bal."
     println(SEP); println("  DB_Julia  —  ", basename(algfile)); println(SEP)
     println("  nGrid      : ", n)
     println("  particles  : ", types)
@@ -100,24 +105,36 @@ function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
     @printf("  Reachable : %d/%d  (%.2fs)\n", erg.reached, erg.total, t3)
     println("  Ergodicity : ", erg.ergodic ? "PASS" : "FAIL")
 
-    println(SEP2); println("  Step 4: Detailed balance (exact-LP chambers + exact rational check)"); println(SEP2)
+    println(SEP2); println("  Step 4: ", cond_name, " (exact-LP chambers + exact rational check)"); println(SEP2)
     local pass, viol, nch, m
     try
         tm = @elapsed m = build_dbmodel(bfs, energy)
-        td = @elapsed ((pass, viol, nch) = run_db_check(m; parallel=parallel))
+        td = @elapsed ((pass, viol, nch) = run_db_check(m; parallel=parallel,
+                                                        mode = balance ? :balance : :detailed))
         @printf("  Chambers : %d   (model %.2fs, check %.2fs)\n", nch, tm, td)
-        @printf("  DB pairs : %d of %d checked  (graph symmetry: %s)\n",
-                length(m.check_pairs), length(m.pairs),
-                isempty(m.sym_names) ? "none verified" : join(m.sym_names, ", "))
+        if balance
+            @printf("  Columns  : %d of %d targets checked  (graph symmetry: %s)\n",
+                    length(m.check_targets), length(states),
+                    isempty(m.sym_names) ? "none verified" : join(m.sym_names, ", "))
+        else
+            @printf("  DB pairs : %d of %d checked  (graph symmetry: %s)\n",
+                    length(m.check_pairs), length(m.pairs),
+                    isempty(m.sym_names) ? "none verified" : join(m.sym_names, ", "))
+        end
     catch e
         e isa CantHandle ? (println("  ERROR: ", e.msg); exit(1)) :
-        e isa OverflowError ? (println("  ERROR: exact-arithmetic overflow (Int128) during DB check — ",
-                                       "system too large for this build."); exit(1)) : rethrow(e)
+        e isa OverflowError ? (println("  ERROR: exact-arithmetic overflow (Int128) during ", cond_name,
+                                       " check — system too large for this build."); exit(1)) : rethrow(e)
     end
     if pass
-        println("  Detailed bal. : PASS  — satisfied for all ", length(states), " states")
+        println("  ", cond_abbr, " : PASS  — satisfied for all ", length(states), " states")
+    elseif balance
+        println("  ", cond_abbr, " : FAIL  — ", length(viol), " violating (target, chamber) record(s):")
+        for v in first(viol, min(5, length(viol)))
+            println("    t=", states[v[1]], "  (chamber ", v[3], ")")
+        end
     else
-        println("  Detailed bal. : FAIL  — ", length(viol), " violating (pair, chamber) record(s):")
+        println("  ", cond_abbr, " : FAIL  — ", length(viol), " violating (pair, chamber) record(s):")
         for v in first(viol, min(5, length(viol)))
             println("    s=", states[v[1]], "  t=", states[v[2]], "  (chamber ", v[3], ")")
         end
@@ -127,12 +144,12 @@ function run_checker(algfile, maxdepth, parallel, n, types, algo, energy)
     println("  Translational : ", bfs.tau_free ? "PASS" : "FAIL")
     println("  State count   : ", count_ok ? "OK" : "MISMATCH")
     println("  Ergodicity    : ", erg.ergodic ? "PASS" : "FAIL")
-    println("  Detailed bal. : ", pass ? "PASS" : "FAIL")
+    println("  ", cond_abbr, " : ", pass ? "PASS" : "FAIL")
     println(SEP)
 
     exit((pass && erg.ergodic && count_ok) ? 0 : 1)
 end
 
-const _ALGFILE, _MAXDEPTH, _PARALLEL = parse_args(ARGS)
+const _ALGFILE, _MAXDEPTH, _PARALLEL, _BALANCE = parse_args(ARGS)
 include(abspath(_ALGFILE))     # top-level: makes user methods visible to the call site
-run_checker(_ALGFILE, _MAXDEPTH, _PARALLEL, Main.NGRID, Main.PARTICLE_TYPES, Main.algorithm, Main.energy)
+run_checker(_ALGFILE, _MAXDEPTH, _PARALLEL, _BALANCE, Main.NGRID, Main.PARTICLE_TYPES, Main.algorithm, Main.energy)

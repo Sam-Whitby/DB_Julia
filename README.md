@@ -51,6 +51,14 @@ anywhere with no thread-startup cost):
 julia --project=. -t auto check.jl examples/vmmc_2d.jl -parallel
 ```
 
+Check **global balance** (`π·T = π`) instead of the stronger detailed balance — this
+accepts correct **non-reversible** samplers that DB rejects (see below):
+
+```
+julia --project=. check.jl examples/directed_sweep.jl            # Detailed balance: FAIL
+julia --project=. check.jl examples/directed_sweep.jl -balance   # Balance: PASS
+```
+
 Run the regression + stress suite (unit pieces, fail-loud paths, and all bundled
 examples with their known PASS/FAIL verdicts):
 
@@ -90,6 +98,7 @@ the next state with plain arithmetic — the harness wraps it onto the torus for
 |---|---|
 | `rand_choice_index!(rng, n)` / `rand_choice!(rng, list)` | uniform choice; exact `1/n` weight |
 | `rand_integer!(rng, lo, hi)` | uniform integer in `[lo,hi]`, exact rejection sampling |
+| `unordered(rng, list)` | iterate `list` order-independently (the OIP contract, below): reads no item content, consumes no bits |
 | `metropolis!(rng, dE)` | accept w.p. `min(1, exp(-β·dE))`; `dE::LinForm` |
 | `accept!(rng, thr)` | accept w.p. a general symbolic threshold `thr::ThExpr` |
 | `th_const, th_boltz, th_linear, th_sub, th_div, th_min, th_max, th_piece, c_lt, c_le` | build symbolic thresholds (for cluster/Barker/rate algorithms) |
@@ -106,6 +115,21 @@ point group permutes — and the checker certifies equivariance under the larges
 subgroup of `D4` that `MOVES` is closed under, reducing the τ-BFS over the lattice
 point group too (up to 8× on top of translation × species). This is opt-in: omit
 `MOVES` and everything behaves as before. See [doc/rotation-taint.md](doc/rotation-taint.md).
+
+**Optional — the `unordered` contract (order-independent iteration).** A move that
+processes a *set* of candidates in a loop whose result does not depend on the
+visiting order (a cluster builder, say) has two bad options for that loop: a
+**sort** that tie-breaks on `state[q].t` (which breaks the species symmetry — this
+is exactly why `vmmc_2d` declines species), or an explicit **random shuffle** of the
+order (which restores the symmetry but multiplies the decision tree by `|cands|!`
+per step). Writing the loop as `for q in unordered(rng, cands)` avoids both: the
+primitive yields a canonical order that **reads no item content** (so it can't break
+a symmetry) and **consumes no random bits** (so the tree does not blow up). You are
+*asserting* order-independence; the checker **verifies** it — it re-BFSes each
+representative in a second candidate order and checks the transition probabilities
+are identical, and raises a **hard error** if your body actually depends on order. So
+you get the small tree of the sorted version *and* the full species + point-group
+symmetry of the shuffled version. See [examples/vmmc_2d_unordered.jl](examples/vmmc_2d_unordered.jl).
 
 The threshold algebra handles: `exp(-β·linear)` and Laurent polynomials in such
 exp-monomials; **`th_linear(L)`** — the bare value `⟨L,J⟩`, so weights may carry
@@ -246,6 +270,28 @@ The test suite checks every example's reduced verdict against the all-pairs base
 > **never** used to conclude anything about DB — it only means more pairs are
 > evaluated. The DB verdict is always computed in full.
 
+### 7. Global balance (`-balance`) — the weaker, *necessary* condition (exact)
+Correct sampling requires only **stationarity** `π·T = π` (global balance); detailed
+balance is a stronger, *sufficient* condition. An entire family of modern samplers —
+event-chain, lifting, Suwa–Todo — deliberately **violates DB** to mix faster, yet
+samples `π` correctly. Passing `-balance` checks balance instead of DB, so those are
+accepted.
+
+Balance is the **column sum** of the DB residual matrix: for each target state `t`,
+```
+B_t  =  Σ_s [ T(s→t)·π(s) − T(t→s)·π(t) ]  =  0 .
+```
+The `s = t` term cancels, so only off-diagonal transitions enter (exactly what the
+graph stores). The check reuses the **same exact rational machinery** as DB — it sums
+the directed leaf contributions over a *common* `(1−exp)` denominator and tests that
+the numerator's coefficients all vanish in `ℚ` — so it is **exact and float-free**,
+just like the DB check. It is symmetry-reduced the same way (one target per verified
+state-orbit, since `B_{g·t} ≡ 0 ⇔ B_t ≡ 0`). `examples/directed_sweep.jl` is the
+canonical demonstration: a directed shift is **DB-FAIL** but **balance-PASS** (a cyclic
+permutation of states keeps the uniform `π` stationary). DB still implies balance, so
+every DB-PASS example also passes `-balance`. Default behaviour is unchanged (detailed
+balance); `-balance` is opt-in.
+
 ### Why it is fast
 - Exact arithmetic in **`Rational{Int128}`** rather than `BigInt`: the BFS no
   longer allocates a GMP bignum per tiny-integer operation (~3× faster), while
@@ -305,9 +351,11 @@ so its BFS is reduced over the point group too.
 | `barker_accept.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
 | `poly_rate_accept.jl` | PASS | PASS | PASS | 504 | 12 | 16 / 4536 | p4m × S₃ |
 | `vmmc_2d_shuffle.jl` ★ | PASS | PASS | PASS | 504 | **4** | 44 / 11088 | p4m × S₃ |
+| `vmmc_2d_unordered.jl` ★ | PASS | PASS | PASS | 504 | **4** | 174 / 11088 | p4m × S₃ |
 | `hop_repeated_species.jl` | PASS | PASS | PASS | 756 | 42 | … | p4m × **S₂ (1↔2)** |
 | `broken_species_halfbeta.jl` | PASS | **FAIL** (species-dep. `β/2`) | PASS | 504 | 56 | … | T·D4 (species declined) |
 | `swap_literal_species.jl` | PASS | PASS | FAIL (N! perms) | 504 | 56 | … | T·D4 (species declined) |
+| `directed_sweep.jl` | PASS | **FAIL** (non-reversible) | FAIL (directed) | 9 | 1 | — | T, reflect_h (**balance PASS** with `-balance`) |
 
 `vmmc_2d_shuffle` is the headline: with the `MOVES` contract its BFS drops 56→**4**
 reps (warm BFS ≈2.5 s → ≈0.8 s) — species *and* full-D4 reduction. `vmmc_2d` declines
@@ -365,14 +413,15 @@ phase runs the species verification (a quick bail when declined).
 
 | Example | BFS | model | DB check | total | BFS'd |
 |---|---|---|---|---|---|
-| `single_metropolis.jl` | 0.08 s | 0.02 s | 1.3 s | ≈ 1.4 s | 12/504 |
-| `kawasaki.jl` | 0.01 s | 0.14 s | ~0 s | ≈ 0.16 s | 12/504 |
-| `metropolis_4x4.jl` | 0.03 s | 0.01 s | 0.27 s | ≈ 0.3 s | 9/240 |
-| `hop_repeated_species.jl` | 0.04 s | 0.01 s | ~0 s | ≈ 0.06 s | 42/756 |
-| `barker_accept.jl` | 0.05 s | 0.17 s | ~0 s | ≈ 0.2 s | 12/504 |
-| `poly_rate_accept.jl` | 0.17 s | 0.03 s | 1.5 s | ≈ 1.7 s | 12/504 |
-| `vmmc_2d_shuffle.jl` | 1.5 s | 0.14 s | 0.9 s | ≈ 2.5 s | 12/504 |
-| `vmmc_2d.jl` | 3.5 s | 0.10 s | 1.3 s | ≈ 4.9 s | 56/504 |
+| `single_metropolis.jl` | 0.03 s | 0.02 s | 1.0 s | ≈ 1.1 s | 4/504 |
+| `kawasaki.jl` | 0.01 s | 0.01 s | ~0 s | ≈ 0.04 s | 4/504 |
+| `metropolis_4x4.jl` | 0.02 s | 0.01 s | 0.29 s | ≈ 0.3 s | 5/240 |
+| `hop_repeated_species.jl` | 0.11 s | 0.01 s | ~0 s | ≈ 0.12 s | 42/756 |
+| `barker_accept.jl` | 0.08 s | 0.02 s | ~0 s | ≈ 0.1 s | 12/504 |
+| `poly_rate_accept.jl` | 0.10 s | 0.03 s | 1.2 s | ≈ 1.3 s | 12/504 |
+| `vmmc_2d.jl` | 0.61 s | 0.06 s | 0.89 s | ≈ 1.6 s | 8/504 |
+| `vmmc_2d_shuffle.jl` | 0.77 s | 0.18 s | 0.92 s | ≈ 1.9 s | 4/504 |
+| `vmmc_2d_unordered.jl` | 0.75 s | 0.06 s | 0.80 s | ≈ 1.6 s | 4/504 |
 
 The **species τ-BFS reduction** is the headline: a species-equivariant algorithm
 BFSes one rep per combined orbit, e.g. `vmmc_2d_shuffle` (a *typical* randomised-order
@@ -383,6 +432,30 @@ With `-parallel` on 8 threads the VMMC BFS drops further. A single cold `check.j
 invocation additionally pays **~13–18 s of Julia JIT compilation** (the engine is
 recompiled per process); the regression suite amortises this, and a
 `PackageCompiler.jl` system image removes it entirely (below).
+
+**The `unordered` primitive (OIP) — small tree *and* full symmetry.** `vmmc_2d`
+declines species because its candidate sort tie-breaks on the type label;
+`vmmc_2d_shuffle` restores species (and gets D4) by drawing a random visiting order,
+but that shuffle multiplies the decision tree by `|cands|!` per cluster step.
+`vmmc_2d_unordered` uses `for q in unordered(rng, cands)` to get **both** — the
+species + point-group symmetry of the shuffle with **none** of its tree blow-up
+(`unordered` consumes no bits). On the bundled 3×3 system the candidate sets are tiny
+(`|cands| ≤ 2`), so the three VMMC variants are within ~15 % of each other (above);
+the OIP win is **asymptotic in the candidate-set size**. Measured directly on a
+single cluster step whose seed has `k` mutually-candidate spectators (shuffle vs
+`unordered`, leaves enumerated by the τ-BFS):
+
+| `k` (candidates) | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|
+| shuffle leaves (`k!·2ᵏ`) | 8 | 48 | 384 | 3 840 | 46 080 | 645 120 |
+| `unordered` leaves (`2ᵏ`) | 4 | 8 | 16 | 32 | 64 | 128 |
+| **reduction** (`= k!`) | 2× | 6× | 24× | 120× | 720× | **5040×** |
+
+so a dense cluster move that a shuffle makes intractable stays flat under `unordered`.
+The cost is a per-run **cross-check**: when `unordered` is used, the engine re-BFSes
+each representative in a second candidate order and asserts the transition
+probabilities are identical (a hard error otherwise), so a body that is *not* actually
+order-independent is caught rather than reduced unsoundly.
 
 ### Removing the JIT warm-up (optional)
 Most of the wall-clock for the small cases is Julia compiling the engine afresh
@@ -419,10 +492,10 @@ whenever it meets something it cannot represent exactly:
 | File | Purpose |
 |---|---|
 | `dbc.jl` | the engine (TauNum, BitSeqRNG, exact rational/Val algebra, exact simplex, BFS, DB check) |
-| `check.jl` | command-line driver (`[-maxdepth N] [-parallel]`) |
+| `check.jl` | command-line driver (`[-maxdepth N] [-parallel] [-balance]`) |
 | `test_db.jl` | unit + fail-loud + end-to-end example suite |
 | `TEMPLATE.jl` | annotated template for writing your own algorithm |
-| `examples/` | nineteen worked translations (standard algorithms + symmetry / weight-class / particle-swap edge cases) |
+| `examples/` | twenty-one worked translations (standard algorithms + symmetry / weight-class / particle-swap / order-independence / non-reversible edge cases) |
 | `AUDIT.md` | critical soundness/performance audit and how each issue is addressed |
 | `doc/expressiveness.md` | the exact class of weight/energy/condition functions handled |
 | `ideas.md` | analysis of inductive generalisation across system sizes, and D4 |

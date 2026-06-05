@@ -211,9 +211,11 @@ EXPECT = [
     ("barker_accept",               (true,  true,  true )),   # (1+exp) denominator (Tier 1)
     ("poly_rate_accept",            (true,  true,  true )),   # polynomial weight factor (Tier 2)
     ("vmmc_2d_shuffle",             (true,  true,  true )),   # random candidate order -> species-equivariant VMMC
+    ("vmmc_2d_unordered",           (true,  true,  true )),   # `unordered` primitive (OIP) -> species + D4, no shuffle blow-up
     ("hop_repeated_species",        (true,  true,  true )),   # species reduction with repeated multiplicities [1,1,2,2]
     ("broken_species_halfbeta",     (true,  false, true )),   # species-dependent accept -> declined, DB FAIL caught
     ("swap_literal_species",        (true,  true,  false)),   # raw-label write -> covariance guard declines
+    ("directed_sweep",              (true,  false, false)),   # non-reversible: DB FAIL (balance PASS, see balance testset)
 ]
 
 function _run_pipeline(n, types, algo, energy; moves=nothing)
@@ -489,6 +491,7 @@ end
     # S2, repeated-multiplicity S2, S2 broken-but-equivariant; and the three DECLINE
     # paths (type tie-break, absolute-type branch, raw-label covariance).
     cases = [("single_metropolis", true), ("kawasaki", true), ("vmmc_2d_shuffle", true),
+             ("vmmc_2d_unordered", true),
              ("metropolis_4x4", true), ("hop_repeated_species", true),
              ("broken_variable_pool", true),
              ("vmmc_2d", false), ("broken_species_halfbeta", false),
@@ -541,6 +544,7 @@ end
     cases = [("single_metropolis", D4, false), ("metropolis_4x4", D4, false),
              ("hop_8way_correct", D4, false), ("horizontal_metropolis", D2, true),
              ("vmmc_2d_shuffle", D4, false),  # species + D4
+             ("vmmc_2d_unordered", D4, false),# species + D4 via the `unordered` primitive
              ("vmmc_2d", D4, false),          # D4 only (sort tie-breaks species)
              ("kawasaki", D4, false)]         # empty move set -> vacuous D4, + species
     @testset "$(name)" for (name, expset, direct) in cases
@@ -573,6 +577,80 @@ end
     @test Set(pt_name.(pointgroup_subgroup(DISPS8)))         == D4    # king moves   -> D4
     @test pointgroup_subgroup([(1,0)]) ⊆ collect(1:8) &&
           "rotate90" ∉ pt_name.(pointgroup_subgroup([(1,0)]))        # single dir: no rotate90
+end
+
+# Order-independent iteration primitive (`unordered`, the OIP). An order-INDEPENDENT
+# body is certified (and its single-order graph equals a direct build — verified by
+# the species/point-group consistency testsets above); an order-DEPENDENT body that
+# misuses `unordered` must be CAUGHT by the cross-check (a hard error), never silently
+# reduced. The win is that `unordered` consumes NO random bits, so it avoids the
+# factorial decision-tree blow-up of an explicit shuffle while keeping the symmetry.
+@testset "OIP: `unordered` certified when valid, misuse caught" begin
+    n = 3; energy = mk_energy(n, 2); states = enumerate_states([1,2,3], n)
+
+    # MISUSE: a body whose successor depends on the VISITING ORDER (it moves the seed
+    # iff the first-linked spectator has an even index — and which spectator is
+    # "first" depends on the order). Its transition probabilities differ between
+    # orders, so the OIP cross-check must hard-error rather than reduce unsoundly.
+    orderdep = (rng, st::PState) -> begin
+        s = rand_choice_index!(rng, length(st)); p = st[s]
+        cands = Int[i for i in 1:length(st) if i != s]
+        first_linked = 0
+        for qi in unordered(rng, cands)
+            (first_linked == 0 && accept!(rng, th_const(1//2))) && (first_linked = qi)
+        end
+        rest = st[setdiff(1:length(st), s)]
+        np = (first_linked != 0 && iseven(first_linked)) ? Particle(p.r, p.c + 1, p.t) : p
+        for q in rest; same_site(q, np, n) && return st; end
+        vcat(rest, [np])
+    end
+    @test_throws CantHandle build_transitions(orderdep, energy, states, n, 30)
+
+    # VALID: the order-INDEPENDENT VMMC variant is certified end-to-end (species + D4)
+    # and the reduced verdict equals the all-pairs baseline.
+    r = run_example(joinpath(@__DIR__, "examples", "vmmc_2d_unordered.jl"))
+    @test r.tau && r.db && r.erg                 # tau / DB / ergodicity all PASS
+    @test r.species_free && !isempty(r.pg_idx)   # species AND point group both engaged
+    @test r.db == r.db_full                       # symmetry reduction is verdict-neutral
+    @test r.nbfs < length(states)                 # actually fewer states BFS'd
+end
+
+# Global balance (`-balance`): the COLUMN-sum condition pi*T = pi, which correct
+# sampling actually requires. It is strictly WEAKER than detailed balance (a
+# non-reversible chain can satisfy balance while violating DB), it is computed by the
+# SAME exact rational machinery (no floats), and the state-orbit reduction must equal
+# the all-targets baseline (sound; speed only).
+@testset "Global balance (-balance): weaker than DB, exact, reduced == full" begin
+    n = 3
+    runmodes(types, algo, en; mv=nothing) = begin
+        states = enumerate_states(types, n)
+        m = build_dbmodel(build_transitions(algo, en, states, n, 30; moves=mv), en)
+        (db       = run_db_check(m; mode=:detailed)[1],
+         bal      = run_db_check(m; mode=:balance)[1],
+         balfull  = run_db_check(m; mode=:balance, use_symmetry=false)[1],
+         ntargets = length(m.check_targets), nstates = length(states))
+    end
+
+    # directed_sweep: the canonical non-reversible chain -> DB FAIL but BALANCE PASS.
+    ds = load_example(joinpath(@__DIR__, "examples", "directed_sweep.jl"))
+    r  = Base.invokelatest(() -> runmodes(ds.PARTICLE_TYPES, ds.algorithm, ds.energy))
+    @test r.db == false                  # detailed balance fails (directed move)
+    @test r.bal == true                  # global balance holds (cyclic permutation -> uniform stationary)
+    @test r.bal == r.balfull             # state-orbit reduction == all-targets baseline
+    @test r.ntargets < r.nstates         # the reduction actually reduces
+
+    # DB ==> balance: a detailed-balance-PASS algorithm also passes balance, reduced
+    # check agreeing with the full baseline.
+    energy = mk_energy(n, 2)
+    rr = runmodes([1,2,3], mk_metropolis(n, 2, energy), energy)
+    @test rr.db == true && rr.bal == true
+    @test rr.bal == rr.balfull
+
+    # A DB-FAIL example: the column reduction is sound regardless of the verdict
+    # (reduced balance == full balance), and DB-FAIL does not imply balance-PASS.
+    bvp = load_example(joinpath(@__DIR__, "examples", "broken_variable_pool.jl"))
+    rb  = Base.invokelatest(() -> runmodes(bvp.PARTICLE_TYPES, bvp.algorithm, bvp.energy))
+    @test rb.bal == rb.balfull
 end
 
 end
