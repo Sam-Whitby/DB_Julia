@@ -126,10 +126,34 @@ per step). Writing the loop as `for q in unordered(rng, cands)` avoids both: the
 primitive yields a canonical order that **reads no item content** (so it can't break
 a symmetry) and **consumes no random bits** (so the tree does not blow up). You are
 *asserting* order-independence; the checker **verifies** it — it re-BFSes each
-representative in a second candidate order and checks the transition probabilities
-are identical, and raises a **hard error** if your body actually depends on order. So
-you get the small tree of the sorted version *and* the full species + point-group
-symmetry of the shuffled version. See [examples/vmmc_2d_unordered.jl](examples/vmmc_2d_unordered.jl).
+representative in **five alternative orders** (the reverse, two cyclic shifts, and
+their reverses) and checks the transition probabilities are identical, raising a
+**hard error** if your body actually depends on order. So you get the small tree of
+the sorted version *and* the full species + point-group symmetry of the shuffled
+version. See [examples/vmmc_2d_unordered.jl](examples/vmmc_2d_unordered.jl).
+
+**Soundness scope of the cross-check (important for exotic moves).** The verification
+is exact and float-free, and it is **sufficient** because order-dependence in a
+cluster move lives in the *diagonal* (self-loop / rejection) leaves, which neither
+detailed balance nor global balance uses; only the **off-diagonal** transition leaves
+are compared, and these are order-invariant *exactly* for an order-independent move.
+Three facts make this robust: (i) **species** relabelling never changes the gather
+order (candidates are position-sorted, and a relabel doesn't move positions), so the
+species reduction is *unconditionally* sound; (ii) for a candidate list of length
+**≤ 3** the five probed orders are **exhaustive** (all permutations), so the check is
+*complete* — and on a lattice a cluster particle rarely has more than three
+simultaneous in-range neighbours; (iii) the regression suite pins every `unordered`
+example against a **direct all-states build** (no derivation), which would catch any
+mis-reduction. A move that genuinely depends on order — e.g. terminating cluster
+growth *inside* the candidate loop and moving the partial cluster — is correctly
+**rejected**; one that stops *after* a whole particle's loop is order-independent and
+**accepted** (see [examples/vmmc_early_stop.jl](examples/vmmc_early_stop.jl), which is
+order-independent yet **DB- and balance-FAIL** — naive early stopping breaks
+sampling, and the checker catches it). Its correct counterpart is
+[examples/cluster_metropolis.jl](examples/cluster_metropolis.jl): a cluster move whose
+early stopping is **fixed by a final Metropolis acceptance** of the cluster against its
+environment (plus the recruitment proposal-ratio) — the original Whitelam–Geissler
+idea — which the checker confirms **DB-PASS** (and balance-PASS).
 
 The threshold algebra handles: `exp(-β·linear)` and Laurent polynomials in such
 exp-monomials; **`th_linear(L)`** — the bare value `⟨L,J⟩`, so weights may carry
@@ -356,6 +380,8 @@ so its BFS is reduced over the point group too.
 | `broken_species_halfbeta.jl` | PASS | **FAIL** (species-dep. `β/2`) | PASS | 504 | 56 | … | T·D4 (species declined) |
 | `swap_literal_species.jl` | PASS | PASS | FAIL (N! perms) | 504 | 56 | … | T·D4 (species declined) |
 | `directed_sweep.jl` | PASS | **FAIL** (non-reversible) | FAIL (directed) | 9 | 1 | — | T, reflect_h (**balance PASS** with `-balance`) |
+| `vmmc_early_stop.jl` ★ | PASS | **FAIL** (early stop) | PASS | 504 | **4** | … | p4m × S₃ (OIP-accepted, order-indep.; **balance FAIL** too) |
+| `cluster_metropolis.jl` ★ | PASS | PASS | PASS | 504 | **4** | … | p4m × S₃ (early stop **fixed** by a final Metropolis vs environment) |
 
 `vmmc_2d_shuffle` is the headline: with the `MOVES` contract its BFS drops 56→**4**
 reps (warm BFS ≈2.5 s → ≈0.8 s) — species *and* full-D4 reduction. `vmmc_2d` declines
@@ -495,7 +521,7 @@ whenever it meets something it cannot represent exactly:
 | `check.jl` | command-line driver (`[-maxdepth N] [-parallel] [-balance]`) |
 | `test_db.jl` | unit + fail-loud + end-to-end example suite |
 | `TEMPLATE.jl` | annotated template for writing your own algorithm |
-| `examples/` | twenty-one worked translations (standard algorithms + symmetry / weight-class / particle-swap / order-independence / non-reversible edge cases) |
+| `examples/` | twenty-three worked translations (standard algorithms + symmetry / weight-class / particle-swap / order-independence / early-termination / non-reversible edge cases) |
 | `AUDIT.md` | critical soundness/performance audit and how each issue is addressed |
 | `doc/expressiveness.md` | the exact class of weight/energy/condition functions handled |
 | `ideas.md` | analysis of inductive generalisation across system sizes, and D4 |

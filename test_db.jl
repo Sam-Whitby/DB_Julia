@@ -216,6 +216,8 @@ EXPECT = [
     ("broken_species_halfbeta",     (true,  false, true )),   # species-dependent accept -> declined, DB FAIL caught
     ("swap_literal_species",        (true,  true,  false)),   # raw-label write -> covariance guard declines
     ("directed_sweep",              (true,  false, false)),   # non-reversible: DB FAIL (balance PASS, see balance testset)
+    ("vmmc_early_stop",             (true,  false, true )),   # order-INDEP early stop: OIP accepts, DB FAIL (balance FAIL too)
+    ("cluster_metropolis",          (true,  true,  true )),   # early stop FIXED by a final Metropolis vs environment -> DB PASS
 ]
 
 function _run_pipeline(n, types, algo, energy; moves=nothing)
@@ -491,7 +493,7 @@ end
     # S2, repeated-multiplicity S2, S2 broken-but-equivariant; and the three DECLINE
     # paths (type tie-break, absolute-type branch, raw-label covariance).
     cases = [("single_metropolis", true), ("kawasaki", true), ("vmmc_2d_shuffle", true),
-             ("vmmc_2d_unordered", true),
+             ("vmmc_2d_unordered", true), ("vmmc_early_stop", true), ("cluster_metropolis", true),
              ("metropolis_4x4", true), ("hop_repeated_species", true),
              ("broken_variable_pool", true),
              ("vmmc_2d", false), ("broken_species_halfbeta", false),
@@ -545,6 +547,8 @@ end
              ("hop_8way_correct", D4, false), ("horizontal_metropolis", D2, true),
              ("vmmc_2d_shuffle", D4, false),  # species + D4
              ("vmmc_2d_unordered", D4, false),# species + D4 via the `unordered` primitive
+             ("vmmc_early_stop", D4, true),   # OIP false-accept detector: reduced==DIRECT all-states
+             ("cluster_metropolis", D4, false),# correct early-stop cluster (final Metropolis vs environment)
              ("vmmc_2d", D4, false),          # D4 only (sort tie-breaks species)
              ("kawasaki", D4, false)]         # empty move set -> vacuous D4, + species
     @testset "$(name)" for (name, expset, direct) in cases
@@ -606,6 +610,31 @@ end
     end
     @test_throws CantHandle build_transitions(orderdep, energy, states, n, 30)
 
+    # MISUSE 2 (the user's early-termination scenario): a cluster builder that stops
+    # MID-candidate-loop and moves the PARTIAL cluster. The partial cluster depends on
+    # which candidates were visited first, so the off-diagonal transition probabilities
+    # are order-dependent -> the cross-check must REJECT it. (Stopping AFTER a whole
+    # particle's loop, by contrast, is order-independent and accepted — see
+    # examples/vmmc_early_stop.jl.) This confirms OIP is not fooled by an early-abort
+    # that reaches an off-diagonal state (not just the diagonal self-loop).
+    midstop = (rng, st::PState) -> begin
+        seedidx = rand_choice_index!(rng, length(st)); dir = rand_move!(rng); p0 = st[seedidx]
+        cluster = [seedidx]; incluster = Set(cluster)
+        pPost = move(p0, dir); cands = Int[]
+        for qi in 1:length(st)
+            (qi in incluster) && continue
+            ((0 < pbc_d2(st[qi], p0, n) <= 2) || (0 < pbc_d2(st[qi], pPost, n) <= 2)) && push!(cands, qi)
+        end
+        for qi in unordered(rng, cands)
+            accept!(rng, th_const(1//2)) && (push!(cluster, qi); push!(incluster, qi))
+            accept!(rng, th_const(1//4)) && break          # MID-loop stop -> order-dependent partial cluster
+        end
+        clset = Set(cluster); noncl = eltype(st)[st[i] for i in 1:length(st) if !(i in clset)]
+        for ci in cluster; dest = move(st[ci], dir); for q in noncl; same_site(q, dest, n) && return st; end; end
+        vcat(noncl, eltype(st)[move(st[ci], dir) for ci in cluster])
+    end
+    @test_throws CantHandle build_transitions(midstop, energy, states, n, 30; moves=DISPS8)
+
     # VALID: the order-INDEPENDENT VMMC variant is certified end-to-end (species + D4)
     # and the reduced verdict equals the all-pairs baseline.
     r = run_example(joinpath(@__DIR__, "examples", "vmmc_2d_unordered.jl"))
@@ -651,6 +680,24 @@ end
     bvp = load_example(joinpath(@__DIR__, "examples", "broken_variable_pool.jl"))
     rb  = Base.invokelatest(() -> runmodes(bvp.PARTICLE_TYPES, bvp.algorithm, bvp.energy))
     @test rb.bal == rb.balfull
+
+    # vmmc_early_stop: an order-INDEPENDENT (OIP-accepted) move that breaks BOTH
+    # conditions — naive early termination samples neither pi via DB nor via balance.
+    # DB-FAIL does NOT imply balance-PASS; the checker catches the broken move both ways.
+    es = load_example(joinpath(@__DIR__, "examples", "vmmc_early_stop.jl"))
+    re = Base.invokelatest(() -> runmodes(es.PARTICLE_TYPES, es.algorithm, es.energy;
+                                          mv = Vector{Tuple{Int,Int}}(es.MOVES)))
+    @test re.db == false && re.bal == false      # both detailed balance AND global balance fail
+    @test re.bal == re.balfull                    # column reduction still sound
+
+    # cluster_metropolis: the SAME early-stopping cluster, now CORRECTED by a final
+    # Metropolis acceptance against the environment (+ the recruitment proposal-ratio).
+    # It satisfies detailed balance, hence also global balance.
+    cm = load_example(joinpath(@__DIR__, "examples", "cluster_metropolis.jl"))
+    rc = Base.invokelatest(() -> runmodes(cm.PARTICLE_TYPES, cm.algorithm, cm.energy;
+                                          mv = Vector{Tuple{Int,Int}}(cm.MOVES)))
+    @test rc.db == true && rc.bal == true
+    @test rc.bal == rc.balfull
 end
 
 end

@@ -479,3 +479,70 @@ A test-harness fragility surfaced and was fixed in passing: redefining a `const`
 (`NGRID`, `PARTICLE_TYPES`, `MOVES`) across sequential `include`s into `Main` is
 unreliable on Julia 1.12 (it silently kept a previous example's value), so each
 example is now loaded into a FRESH module — no cross-example const collisions.
+
+### 5.15 OIP (`unordered`) + `-balance` mode: exactness and the soundness scope of the cross-check
+
+Two features were added (merged commit `40516b3`) and then the OIP cross-check was
+hardened after a rigorous robustness review.
+
+**`-balance` (global balance).** Correct sampling requires only stationarity
+`π·T = π`, the COLUMN sum of the detailed-balance residual matrix; detailed balance is
+the stronger per-pair condition. `-balance` checks the column sums, accepting correct
+NON-REVERSIBLE samplers (event-chain, lifting, Suwa–Todo) that DB rejects. It reuses
+the exact rational machinery: because the column sum mixes pairs with different
+`(1−exp)` denominators, the directed leaf contributions are aggregated over a COMMON
+denominator (not the per-pair-cleared numerators), so the test stays exact. It is
+symmetry-reduced by one target per verified state-orbit (`B_{g·t} ≡ 0 ⇔ B_t ≡ 0`).
+`examples/directed_sweep.jl` is the canonical DB-FAIL / balance-PASS case.
+
+**OIP exactness — why the off-diagonal comparison is the right object.** The
+order-independence cross-check first used a float-sampled per-successor comparison.
+It is now EXACT (rational + canonical threshold keys) and float-free, by comparing
+only the OFF-DIAGONAL leaf multiset. The reason this is both exact and sufficient: an
+early-abort move (VMMC's frustration → reject) decomposes its rejection probability
+into DIFFERENT partial-product leaves per visiting order, but those land on the
+DIAGONAL (self-loop), and the diagonal enters NEITHER detailed balance NOR global
+balance (both cancel the `s=t` term; the stored graph already drops self-loops). The
+off-diagonal transition leaves are order-invariant exactly for an order-independent
+move, so an off-diagonal multiset comparison is exact and decisive.
+
+**The robustness question, and the hardening.** Is the off-diagonal argument special
+to VMMC, or general? A deliberate stress investigation (the user's early-termination
+variant included) established:
+
+- *End-of-particle* early termination (stop after a cluster particle's whole candidate
+  loop) is **order-INDEPENDENT** — the cluster reached is the same SET regardless of
+  visiting order — so the cross-check correctly ACCEPTS it. `examples/vmmc_early_stop.jl`
+  is exactly this, and the checker correctly reports it **DB-FAIL and balance-FAIL**
+  (naive early stopping without compensation does not sample `π`). Its OIP-reduced
+  graph is validated EQUAL to a direct all-states build.
+- *Mid-loop* early termination (stop INSIDE the candidate loop and move the partial
+  cluster) is **order-DEPENDENT** — the partial cluster depends on which candidates were
+  visited first — so the off-diagonal sum itself differs between orders, and the
+  cross-check correctly REJECTS it (hard error). Verified with an explicit example whose
+  off-diagonal `T(s→t)` differs (`15/256` vs `31/256`) across two orders.
+
+Two structural facts bound the soundness, and a third backs it:
+
+1. **Species relabelling never changes the gather order** (candidates are gathered in
+   position-sorted order, and a relabel moves no positions), so the species reduction
+   under `unordered` is *unconditionally* sound — no order-independence needed.
+2. **For ≤ 3 simultaneous candidates the check is EXHAUSTIVE.** Translation/point-group
+   derivation does depend on order-independence (those isometries re-sort positions).
+   The cross-check now probes FIVE alternative orders — the reverse, two cyclic shifts,
+   and their reverses — which for a candidate list of length ≤ 3 realise ALL
+   permutations. On a lattice a cluster particle rarely has more than three in-range
+   occupied neighbours at once, so this is complete in the common case; for longer
+   lists it is a strong sample (not a proof).
+3. **Direct-build validation.** Every `unordered` example is pinned in the suite against
+   a DIRECT all-states build (`_pg_graph_consistency(direct=true)` for `vmmc_early_stop`),
+   the gold-standard false-accept detector; no mis-reduction was ever observed.
+
+Honest residual limit: for a move with **> 3** simultaneous candidates that is
+order-dependent in a way symmetric under all five probed orders, the per-run check is
+strong but not a complete proof; such a move would have to evade the dihedral order set
+AND the suite's direct-build check. The recommendation for such exotic order-terminating
+moves is the explicit shuffle (`vmmc_2d_shuffle`-style), which order-averages by
+construction. The default detailed-balance path for every algorithm NOT using
+`unordered` is completely unaffected (the cross-check runs only when `unordered` is
+called).

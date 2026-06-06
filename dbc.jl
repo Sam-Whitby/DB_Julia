@@ -402,8 +402,11 @@ tau_violation!(msg::String) = (i = Threads.threadid(); _TAU[i] = true; _TAU_MSG[
 # `_OIP_USED` (thread-local) records whether the algorithm called it this run.
 const _OIP_ORDER = Ref(1)
 const _OIP_USED  = [false]
-_oip_clear!() = (for i in eachindex(_OIP_USED); _OIP_USED[i] = false; end; _OIP_ORDER[] = 1)
+const _OIP_MAXK  = [0]              # max candidate-list length seen (per thread)
+_oip_clear!() = (for i in eachindex(_OIP_USED); _OIP_USED[i] = false; end;
+                 for i in eachindex(_OIP_MAXK); _OIP_MAXK[i] = 0; end; _OIP_ORDER[] = 1)
 _oip_used()   = any(_OIP_USED)
+_oip_maxk()   = isempty(_OIP_MAXK) ? 0 : maximum(_OIP_MAXK)
 
 # Resize the thread-local scratch (tau flags + interning caches) to the active
 # thread count and clear it. Call once at the start of each run.
@@ -418,6 +421,7 @@ function _init_threadlocal!()
     resize!(_ROT_BAD, nt);      fill!(_ROT_BAD, false)
     resize!(_ROT_MSG, nt);      fill!(_ROT_MSG, "")
     resize!(_OIP_USED, nt);     fill!(_OIP_USED, false); _OIP_ORDER[] = 1
+    resize!(_OIP_MAXK, nt);     fill!(_OIP_MAXK, 0)
     resize!(_TH_CACHES, nt)
     for i in 1:nt; _TH_CACHES[i] = Dict{Any,ThExpr}(); end
     nothing
@@ -674,12 +678,23 @@ end
 # for call-site symmetry with the other primitives but is not consumed. Returns a
 # fresh Vector (the caller may iterate or mutate it).
 function unordered(rng, items::AbstractVector)
-    i = Threads.threadid(); (i <= length(_OIP_USED)) && (_OIP_USED[i] = true)
-    v = collect(items)
-    ord = _OIP_ORDER[]
-    ord == 1 && return v
-    ord == 2 && return reverse(v)
-    length(v) <= 1 ? v : vcat(v[2:end], v[1:1])        # ord == 3: cyclic shift by 1
+    i = Threads.threadid()
+    if i <= length(_OIP_USED); _OIP_USED[i] = true; _OIP_MAXK[i] = max(_OIP_MAXK[i], length(items)); end
+    _oip_perm(collect(items), _OIP_ORDER[])
+end
+# The alternative visitation orders the cross-check probes. Modes 1..6 are the six
+# elements of the dihedral group of orderings (cyclic shifts and their reverses), so
+# for a candidate list of length <= 3 the set {1,..,6} is EXHAUSTIVE (it realises all
+# 1, 2, or 6 permutations); for longer lists it is a strong sample. Mode 1 is the
+# algorithm's own (canonical) order.
+function _oip_perm(v::Vector, mode::Int)
+    length(v) <= 1 && return v
+    mode == 1 && return v
+    mode == 2 && return reverse(v)
+    mode == 3 && return circshift(v, 1)
+    mode == 4 && return circshift(v, 2)
+    mode == 5 && return reverse(circshift(v, 1))
+    return reverse(circshift(v, 2))                    # mode 6
 end
 
 # General acceptance test: mirrors  RandomReal[] < thr  for an arbitrary symbolic
@@ -1127,19 +1142,26 @@ function _bfs_seeds_oip(algo, seeds::Vector{CState}, n::Int, maxdepth::Int, para
         sp = copy(_SPECIES_BAD); spm = copy(_SP_MSG)
         ro = copy(_ROT_BAD);     rom = copy(_ROT_MSG); rp = _ROT_PROBE[]
         _ROT_PROBE[] = false
-        # One reversed order: with the candidate list reversed, two genuinely
-        # order-dependent prefixes differ, while an order-independent body's summed
-        # per-successor probabilities are unchanged. (A reversal already exercises
-        # the cyclic-shift order on >2 candidates; order 3 is available for a
-        # stronger check if ever needed.)
-        _OIP_ORDER[] = 2
-        alt = _bfs_seeds(algo, seeds, n, maxdepth, parallel; seedfn = augmented_pstate)
-        for i in eachindex(seeds)
-            _oip_match(base[i], alt[i], seeds[i]) || begin
-                _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
-                cant("unordered(): the result depends on the candidate visitation order " *
-                     "(off-diagonal transition probabilities differ between two orders) — " *
-                     "`unordered` requires the loop body's effect to be independent of order")
+        # Probe alternative visitation orders. If every `unordered` call had <= 2
+        # candidates, the reverse is the ONLY other permutation, so probing order 2 is
+        # already EXHAUSTIVE (complete). If some call had >= 3, probe the five
+        # non-identity dihedral orderings (reverse, two cyclic shifts, and their
+        # reverses) — exhaustive over all permutations for length-3 lists, a strong
+        # sample beyond. An order-DEPENDENT body changes its off-diagonal leaf multiset
+        # under one of these; an order-INDEPENDENT body is unchanged under all. A
+        # mismatch is a hard error. (The off-diagonal restriction is what makes this
+        # exact and sufficient — see `_oip_match`.)
+        ords = _oip_maxk() <= 2 ? (2:2) : (2:6)
+        for ord in ords
+            _OIP_ORDER[] = ord
+            alt = _bfs_seeds(algo, seeds, n, maxdepth, parallel; seedfn = augmented_pstate)
+            for i in eachindex(seeds)
+                _oip_match(base[i], alt[i], seeds[i]) || begin
+                    _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
+                    cant("unordered(): the result depends on the candidate visitation order " *
+                         "(off-diagonal transition probabilities differ between two orders) — " *
+                         "`unordered` requires the loop body's effect to be independent of order")
+                end
             end
         end
         _OIP_ORDER[] = 1; _ROT_PROBE[] = rp
